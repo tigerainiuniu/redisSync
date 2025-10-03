@@ -1,0 +1,173 @@
+# Redis同步服务配置文件示例
+# 复制此文件为 config.yaml 并根据需要修改配置
+
+# 源Redis配置
+source:
+  host: "localhost"          # Redis主机地址
+  port: 6379                 # Redis端口
+  password: null             # Redis密码，如果没有密码则设为null
+  db: 0                      # Redis数据库编号
+  ssl: false                 # 是否使用SSL连接
+
+  # 跨境传输优化配置（适用于远距离、高延迟网络）
+  socket_timeout: 60         # 套接字超时时间（秒）- 跨境建议60秒
+  socket_connect_timeout: 30 # 连接超时时间（秒）
+  socket_keepalive: false    # 启用TCP keepalive（某些系统不支持，建议false）
+  connection_pool_max_connections: 50  # 连接池最大连接数
+
+# 目标Redis配置列表（支持多个目标）
+targets:
+  # 目标1：本地测试Redis
+  - name: "local-target"
+    host: "localhost"
+    port: 6380
+    password: null
+    db: 0
+    ssl: false
+    enabled: true            # 是否启用此目标
+  
+  # 目标2：远程Redis（示例）
+  - name: "remote-target"
+    host: "192.168.1.100"
+    port: 6379
+    password: "your-password"
+    db: 0
+    ssl: false
+    enabled: false           # 暂时禁用
+  
+  # 目标3：云Redis（示例）
+  - name: "cloud-target"
+    host: "redis.example.com"
+    port: 6380
+    password: "cloud-password"
+    db: 1
+    ssl: true
+    enabled: false           # 暂时禁用
+
+# 同步配置
+sync:
+  # 同步模式: 
+  # - full: 仅全量同步
+  # - incremental: 仅增量同步
+  # - hybrid: 先全量后增量（推荐）
+  mode: "hybrid"
+  
+  # 全量同步配置
+  full_sync:
+    strategy: "scan"         # 策略: scan, sync, dump_restore
+    batch_size: 1000         # 批处理大小（每批处理的键数）
+    scan_count: 10000        # SCAN命令的COUNT参数（每次SCAN返回的键数，建议5000-20000）
+    preserve_ttl: true       # 保持TTL
+    clear_target: false      # 是否清空目标数据库
+    verify_migration: true   # 是否验证迁移结果
+    key_pattern: "*"         # 键模式过滤
+    key_types: null          # 键类型过滤，null表示所有类型
+    
+  # 增量同步配置
+  incremental_sync:
+    enabled: true            # 是否启用增量同步
+    interval: 30             # 同步间隔（秒）
+    max_changes_per_sync: 10000  # 每次同步最大变更数
+    key_pattern: "*"         # 键模式过滤
+    key_types: null          # 键类型过滤
+    change_detection_method: "idle_time"  # 变更检测方法
+    
+  # 过滤配置
+  filters:
+    include_patterns:        # 包含的键模式
+      - "*"
+    exclude_patterns:        # 排除的键模式
+      - "temp:*"
+      - "cache:*"
+      - "session:*"
+    min_ttl: 0              # 最小TTL（秒）
+    max_key_size: 104857600 # 最大键大小（100MB）
+
+# 服务配置
+service:
+  name: "redis-sync-service"
+  
+  # 日志配置
+  logging:
+    level: "INFO"           # 日志级别: DEBUG, INFO, WARNING, ERROR
+    file: "redis-sync.log"  # 日志文件路径
+    max_size: 104857600     # 日志文件最大大小（100MB）
+    backup_count: 5         # 保留的日志文件数量
+    format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    
+  # 监控配置
+  monitoring:
+    enabled: true
+    metrics_interval: 60    # 指标收集间隔（秒）
+    health_check_interval: 30  # 健康检查间隔（秒）
+    
+  # 性能配置
+  performance:
+    max_workers: 8          # 最大工作线程数（并发目标数，建议4-16）
+    queue_size: 10000       # 任务队列大小
+    memory_limit: 1073741824  # 内存限制（1GB）
+
+    # Pipeline批量操作配置（性能优化核心）
+    pipeline_batch_size: 100  # Pipeline批量大小（每批处理的键数，建议50-200）
+    scan_count: 10000       # SCAN命令的COUNT参数（建议5000-20000）
+    
+  # 重试配置（跨境传输优化）
+  retry:
+    max_attempts: 5         # 最大重试次数（跨境建议5次）
+    backoff_factor: 2       # 退避因子（指数退避：1s, 2s, 4s, 8s, 16s）
+    max_delay: 60           # 最大延迟（秒）
+    initial_delay: 1        # 初始延迟（秒）
+    
+  # 故障转移配置
+  failover:
+    enabled: true
+    max_failures: 5         # 最大连续失败次数
+    failure_window: 300     # 失败窗口期（秒）
+    recovery_delay: 60      # 恢复延迟（秒）
+
+# 通知配置（可选）
+notifications:
+  enabled: false
+  
+  # 邮件通知
+  email:
+    enabled: false
+    smtp_host: "smtp.gmail.com"
+    smtp_port: 587
+    username: "your-email@gmail.com"
+    password: "your-app-password"
+    from_addr: "your-email@gmail.com"
+    to_addrs:
+      - "admin@example.com"
+    
+  # Webhook通知
+  webhook:
+    enabled: false
+    url: "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK"
+    timeout: 30
+    
+  # 通知事件
+  events:
+    - "service_start"
+    - "service_stop"
+    - "sync_error"
+    - "target_failure"
+    - "recovery"
+
+# 安全配置（可选）
+security:
+  auth_enabled: false
+  api_key: null
+  allowed_ips:
+    - "127.0.0.1"
+    - "::1"
+  encryption:
+    enabled: false
+    key: null
+
+# Web管理界面配置
+web_ui:
+  enabled: true             # 是否启用Web界面
+  host: "0.0.0.0"          # 监听地址，0.0.0.0表示所有接口
+  port: 8080               # 监听端口
+  debug: false             # 是否启用调试模式

@@ -1,0 +1,109 @@
+# 与 docker-compose.yml 五实例对应：源 6378，目标 6380–6383
+# 启动服务: 在 temp_review 目录执行
+#   python3 run_sync_service.py --config docker/redis-five/config.docker.yaml
+
+source:
+  host: "127.0.0.1"
+  port: 6378
+  password: null
+  db: 0
+  ssl: false
+
+targets:
+  - name: "t1"
+    host: "127.0.0.1"
+    port: 6380
+    password: null
+    db: 0
+    ssl: false
+    enabled: true
+  - name: "t2"
+    host: "127.0.0.1"
+    port: 6381
+    password: null
+    db: 0
+    ssl: false
+    enabled: true
+  - name: "t3"
+    host: "127.0.0.1"
+    port: 6382
+    password: null
+    db: 0
+    ssl: false
+    enabled: true
+  - name: "t4"
+    host: "127.0.0.1"
+    port: 6383
+    password: null
+    db: 0
+    ssl: false
+    enabled: true
+
+sync:
+  mode: "hybrid"
+  full_sync:
+    strategy: "scan"
+    batch_size: 200
+    scan_count: 2000
+    preserve_ttl: true
+    clear_target: true
+    verify_migration: false
+    key_pattern: "*"
+    key_types: null
+  incremental_sync:
+    enabled: true
+    interval: 5
+    max_changes_per_sync: 5000
+    key_pattern: "*"
+    key_types: null
+    change_detection_method: "idle_time"
+    command_dedup_window: 0
+  filters:
+    include_patterns: ["*"]
+    exclude_patterns: []
+
+service:
+  name: "redis-sync-docker-five"
+  logging:
+    level: "INFO"
+    file: "redis-sync-docker.log"
+    max_size: 10485760
+    backup_count: 2
+    format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  monitoring:
+    enabled: false
+    metrics_interval: 60
+    health_check_interval: 30
+  performance:
+    max_workers: 8
+    queue_size: 10000
+    memory_limit: 536870912
+    pipeline_batch_size: 100
+    scan_count: 2000
+  retry:
+    max_attempts: 5
+    backoff_factor: 2
+    max_delay: 30
+    initial_delay: 1
+  failover:
+    enabled: true
+    max_failures: 5
+    failure_window: 300
+    recovery_delay: 30
+
+notifications:
+  enabled: false
+
+security:
+  auth_enabled: false
+  api_key: null
+  allowed_ips: ["127.0.0.1"]
+  encryption:
+    enabled: false
+    key: null
+
+web_ui:
+  enabled: true
+  host: "127.0.0.1"
+  port: 18080
+  debug: false

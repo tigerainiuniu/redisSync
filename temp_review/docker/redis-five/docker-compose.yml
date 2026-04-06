@@ -1,0 +1,65 @@
+# 5 个独立 Redis：1 源 + 4 目标，供一对多同步本地联调
+# 用法: cd docker/redis-five && docker compose up -d
+# 端口映射: 宿主机 6378（源）+ 6380–6383（目标）
+# 源不用 6379，避免与本机已运行的 Redis 抢端口
+
+services:
+  redis-src:
+    image: redis:7-alpine
+    container_name: redis-five-src
+    ports:
+      - "6378:6379"
+    command: ["redis-server", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  redis-t1:
+    image: redis:7-alpine
+    container_name: redis-five-t1
+    ports:
+      - "6380:6379"
+    command: ["redis-server", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  redis-t2:
+    image: redis:7-alpine
+    container_name: redis-five-t2
+    ports:
+      - "6381:6379"
+    command: ["redis-server", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  redis-t3:
+    image: redis:7-alpine
+    container_name: redis-five-t3
+    ports:
+      - "6382:6379"
+    command: ["redis-server", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  redis-t4:
+    image: redis:7-alpine
+    container_name: redis-five-t4
+    ports:
+      - "6383:6379"
+    command: ["redis-server", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15

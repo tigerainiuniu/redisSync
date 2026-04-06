@@ -1,0 +1,21 @@
+五实例 Redis（Docker）+ 本仓库同步服务
+
+1) 启动容器（需本机 Docker Desktop / dockerd 已运行）
+   cd docker/redis-five
+   docker compose up -d
+   docker compose ps
+
+2) 检查配置
+   cd ../..   # 回到 temp_review 根目录
+   python3 run_sync_service.py --config docker/redis-five/config.docker.yaml --check-config
+
+3) 自动化冒烟（源写键 → 对 4 个目标各跑一轮全量 SCAN → 逐键比对）
+   python3 scripts/e2e_five_redis.py
+
+4) 长期跑「业务」同步服务（混合全量+增量，Web UI http://127.0.0.1:18080）
+   python3 run_sync_service.py --config docker/redis-five/config.docker.yaml
+
+5) 停止容器
+   cd docker/redis-five && docker compose down
+
+端口: 源 6378 | 目标 6380 6381 6382 6383

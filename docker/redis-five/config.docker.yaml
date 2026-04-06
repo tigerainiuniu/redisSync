@@ -1,5 +1,5 @@
 # 与 docker-compose.yml 五实例对应：源 6378，目标 6380–6383
-# 启动服务: 在 temp_review 目录执行
+# 启动服务: 在仓库根目录执行
 #   python3 run_sync_service.py --config docker/redis-five/config.docker.yaml
 
 source:

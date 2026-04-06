@@ -6,7 +6,7 @@
   cd docker/redis-five && docker compose up -d
   等待 healthcheck 就绪（约数秒）
 
-在 temp_review 目录执行:
+在仓库根目录执行:
   python3 scripts/e2e_five_redis.py
 """
 

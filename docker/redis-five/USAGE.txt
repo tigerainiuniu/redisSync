@@ -6,7 +6,7 @@
    docker compose ps
 
 2) 检查配置
-   cd ../..   # 回到 temp_review 根目录
+   cd ../..   # 回到仓库根目录（与 docker/redis-five 同级）
    python3 run_sync_service.py --config docker/redis-five/config.docker.yaml --check-config
 
 3) 自动化冒烟（源写键 → 对 4 个目标各跑一轮全量 SCAN → 逐键比对）

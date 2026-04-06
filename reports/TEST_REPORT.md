@@ -1,7 +1,7 @@
 # Redis 同步项目 — 测试报告
 
 **生成时间**：2026-04-06（本轮复测）  
-**项目路径**：`temp_review/`  
+**项目路径**：仓库根目录（原 `temp_review` 内容已提升至根目录）  
 **执行者**：自动化测试（Docker Compose / pytest / compileall / 配置检查 / E2E）
 
 ---
@@ -33,7 +33,7 @@
 ### 2.1 Docker
 
 ```bash
-cd temp_review/docker/redis-five
+cd docker/redis-five
 docker compose up -d --force-recreate
 docker compose ps
 ```
@@ -43,9 +43,10 @@ docker compose ps
 ### 2.2 pytest
 
 ```bash
-cd temp_review
 python3 -m pytest tests/ -v --tb=short --junitxml=reports/junit.xml
 ```
+
+（于仓库根目录执行。）
 
 **退出码**：0（约 0.45s）
 

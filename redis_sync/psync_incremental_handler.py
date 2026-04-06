@@ -278,21 +278,23 @@ class PSyncIncrementalHandler:
                 speed = skipped / elapsed / 1024 / 1024 if elapsed > 0 else 0
                 logger.info(f"✅ RDB数据已跳过: {skipped}/{rdb_size} 字节，耗时 {elapsed:.1f} 秒，平均速度: {speed:.2f} MB/s")
 
-                # RESP Bulk：$<n>\r\n <n 字节体> \r\n —— 体后必须再消费 \r\n，否则后续命令流首字节不是 *，解析会永久卡住
-                tail = b""
-                while len(tail) < 2:
-                    part = connection._sock.recv(2 - len(tail))
-                    if not part:
-                        logger.error("读取 RDB bulk 尾 \\r\\n 时连接断开")
-                        break
-                    tail += part
-                if tail != b"\r\n":
-                    logger.error(
-                        "RDB bulk 尾部应为 \\r\\n，实际 %r；命令流解析可能错位",
-                        tail,
+                # RESP 标准 bulk 在 N 字节体后可有 \r\n，但 Redis 主从复制里 RDB 块后
+                # 很多版本直接接命令流（以 * 开头），并不再发尾 \r\n。
+                # 若盲目 recv(2) 会误吞 *1 等命令头导致解析错位，故仅 PEEK 到 \r\n 才消费。
+                try:
+                    peek = connection._sock.recv(2, socket.MSG_PEEK)
+                except OSError:
+                    peek = b""
+                if peek == b"\r\n":
+                    connection._sock.recv(2)
+                    logger.debug("📡 已跳过 RDB bulk 尾 \\r\\n")
+                elif peek:
+                    logger.debug(
+                        "📡 RDB 后下一帧为 %r（无主库 bulk 尾 \\r\\n 属正常），命令流从此接续",
+                        peek,
                     )
 
-                logger.debug("📡 RDB 跳过完成（含 bulk 尾 \\r\\n），准备接收命令流")
+                logger.debug("📡 RDB 跳过完成，准备接收命令流")
 
             else:
                 logger.warning(f"⚠️  意外的 RDB 第一个字节: {first_byte.hex()} (期望 '$' = 0x24)")

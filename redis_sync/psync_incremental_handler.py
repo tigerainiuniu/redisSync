@@ -1,458 +1,1025 @@
-"""
-PSYNC实时增量同步处理器
+"""PSYNC-based real-time replication."""
 
-使用Redis PSYNC协议实现实时增量同步，类似RedisShake的实现方式。
-这是最快速、最实时的增量同步方法。
-"""
+from __future__ import annotations
+
+import logging
+import os
+import socket
+import tempfile
+import threading
+from collections import deque
+from contextlib import contextmanager
+from typing import Callable, List, Optional, Tuple
 
 import redis
-import logging
-import threading
-import time
-import socket
-from typing import Optional, Callable, List, Dict, Any
 
-from .redis_protocol import parse_resp_array_command
+from .redis_protocol import (
+    MAX_REPLICATION_BUFFER_SIZE,
+    MAX_REPLICATION_PENDING_SIZE,
+    ReplicationConnectionClosed,
+    ReplicationProtocolError,
+    ReplicationStreamReader,
+    SnapshotRequiredError,
+    is_replconf_getack,
+)
 
 
 logger = logging.getLogger(__name__)
+_WORKER_JOIN_TIMEOUT = 0.5
+
+
+class _ReplicationStopped(Exception):
+    pass
+
+
+class _CaptureSegment:
+    def __init__(self, size_limit: int):
+        self.file = tempfile.SpooledTemporaryFile(
+            max_size=size_limit,
+            mode="w+b",
+        )
+        self.read_position = 0
+        self.write_position = 0
+        self.sealed = False
+        self.path: Optional[str] = None
+
+
+class _DiskBackedCapture:
+    """A blocking stream whose consumed disk segments are deleted promptly."""
+
+    def __init__(
+        self,
+        max_memory_size: int = 8 * 1024 * 1024,
+        max_total_size: int = 1024 * 1024 * 1024,
+    ):
+        self._segment_size = max(1, int(max_memory_size))
+        self._max_total_size = int(max_total_size)
+        if self._max_total_size < 1:
+            raise ValueError("replication capture max_total_size must be positive")
+        self._segments = deque()
+        self._condition = threading.Condition()
+        self._buffered_size = 0
+        self._ever_rolled = False
+        self._sealed = False
+        self._closed = False
+        self._error: Optional[BaseException] = None
+        self._pending_unlinks = set()
+
+    @property
+    def error(self) -> Optional[BaseException]:
+        with self._condition:
+            return self._error
+
+    @property
+    def rolled_to_disk(self) -> bool:
+        with self._condition:
+            return self._ever_rolled or any(
+                segment.path is not None
+                or bool(getattr(segment.file, "_rolled", False))
+                for segment in self._segments
+            )
+
+    @property
+    def stored_size(self) -> int:
+        with self._condition:
+            return sum(segment.write_position for segment in self._segments)
+
+    def _new_segment(self) -> _CaptureSegment:
+        segment = _CaptureSegment(self._segment_size)
+        self._segments.append(segment)
+        return segment
+
+    def _seal_full_segment(self, segment: _CaptureSegment) -> None:
+        source = segment.file
+        if source is None:
+            raise OSError("replication spool segment has no writable file")
+
+        persisted = None
+        path = None
+        try:
+            persisted = tempfile.NamedTemporaryFile(
+                prefix="redis-sync-repl-",
+                suffix=".spool",
+                mode="w+b",
+                delete=False,
+            )
+            path = persisted.name
+            source.seek(0)
+            remaining = segment.write_position
+            while remaining:
+                amount = min(1024 * 1024, remaining)
+                chunk = source.read(amount)
+                if len(chunk) != amount:
+                    raise OSError(
+                        "short replication spool persistence read: "
+                        f"{len(chunk)}/{amount} bytes"
+                    )
+                written = persisted.write(chunk)
+                if written != len(chunk):
+                    raise OSError(
+                        "short replication spool persistence write: "
+                        f"{written}/{len(chunk)} bytes"
+                    )
+                remaining -= len(chunk)
+            persisted.close()
+            persisted = None
+        except Exception:
+            if persisted is not None:
+                try:
+                    persisted.close()
+                except Exception:
+                    pass
+            if path is not None:
+                self._unlink_or_defer(path, incomplete=True)
+            raise
+
+        segment.file = None
+        segment.path = path
+        segment.sealed = True
+        self._ever_rolled = True
+        try:
+            source.close()
+        except Exception:
+            logger.warning("failed to close in-memory replication spool", exc_info=True)
+
+    @staticmethod
+    def _open_segment_for_read(segment: _CaptureSegment):
+        if segment.file is None:
+            if segment.path is None:
+                raise OSError("replication spool segment has no readable file")
+            segment.file = open(segment.path, "rb")
+        return segment.file
+
+    def _unlink_or_defer(self, path: str, incomplete: bool = False) -> None:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            self._pending_unlinks.discard(path)
+        except Exception:
+            self._pending_unlinks.add(path)
+            logger.warning(
+                "failed to remove %sreplication spool %s; cleanup will retry",
+                "incomplete " if incomplete else "",
+                path,
+                exc_info=True,
+            )
+        else:
+            self._pending_unlinks.discard(path)
+
+    def _retry_pending_unlinks(self, final: bool = False) -> None:
+        for path in tuple(self._pending_unlinks):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                self._pending_unlinks.discard(path)
+            except Exception:
+                continue
+            else:
+                self._pending_unlinks.discard(path)
+        if final and self._pending_unlinks:
+            logger.warning(
+                "replication spool files remain after close: %s",
+                ", ".join(sorted(self._pending_unlinks)),
+            )
+
+    def _dispose_segment(self, segment: _CaptureSegment) -> None:
+        file_obj = segment.file
+        segment.file = None
+        if file_obj is not None:
+            try:
+                file_obj.close()
+            except Exception:
+                logger.warning("failed to close replication spool segment", exc_info=True)
+
+        path = segment.path
+        segment.path = None
+        if path is not None:
+            self._unlink_or_defer(path)
+
+    def append(self, data: bytes) -> None:
+        if not data:
+            return
+        with self._condition:
+            if self._closed or self._sealed:
+                raise RuntimeError("replication capture is already sealed")
+            if self._buffered_size + len(data) > self._max_total_size:
+                error = ReplicationProtocolError(
+                    "replication capture pending data exceeds configured limit: "
+                    f"{self._buffered_size + len(data)} > "
+                    f"{self._max_total_size} bytes"
+                )
+                self._error = error
+                self._closed = True
+                self._sealed = True
+                while self._segments:
+                    self._dispose_segment(self._segments.popleft())
+                self._buffered_size = 0
+                self._retry_pending_unlinks(final=True)
+                self._condition.notify_all()
+                raise error
+            remaining = memoryview(data)
+            while remaining:
+                segment = (
+                    self._segments[-1]
+                    if self._segments and not self._segments[-1].sealed
+                    else self._new_segment()
+                )
+                capacity = self._segment_size - segment.write_position
+                if capacity == 0:
+                    self._seal_full_segment(segment)
+                    continue
+                amount = min(capacity, len(remaining))
+                segment.file.seek(segment.write_position)
+                written = segment.file.write(remaining[:amount])
+                if written != amount:
+                    raise OSError(
+                        f"short replication spool write: {written}/{amount} bytes"
+                    )
+                segment.write_position += written
+                self._buffered_size += written
+                remaining = remaining[written:]
+                if remaining and segment.write_position == self._segment_size:
+                    self._seal_full_segment(segment)
+            self._condition.notify_all()
+
+    def seal(self, error: Optional[BaseException] = None) -> None:
+        with self._condition:
+            if error is not None and self._error is None:
+                self._error = error
+            self._sealed = True
+            self._condition.notify_all()
+
+    def read(self, size: int = -1) -> bytes:
+        with self._condition:
+            self._retry_pending_unlinks()
+            while (
+                self._buffered_size == 0
+                and not self._sealed
+                and not self._closed
+            ):
+                self._condition.wait()
+
+            if self._closed:
+                if self._error is not None:
+                    raise self._error
+                raise ValueError("read from closed replication capture")
+
+            if self._buffered_size > 0:
+                requested = (
+                    self._buffered_size
+                    if size is None or size < 0
+                    else min(size, self._buffered_size)
+                )
+                chunks = []
+                remaining = requested
+                while remaining and self._segments:
+                    segment = self._segments[0]
+                    available = segment.write_position - segment.read_position
+                    amount = min(remaining, available)
+                    segment_file = self._open_segment_for_read(segment)
+                    segment_file.seek(segment.read_position)
+                    chunk = segment_file.read(amount)
+                    if len(chunk) != amount:
+                        raise OSError(
+                            f"short replication spool read: {len(chunk)}/{amount} bytes"
+                        )
+                    chunks.append(chunk)
+                    segment.read_position += len(chunk)
+                    self._buffered_size -= len(chunk)
+                    remaining -= len(chunk)
+
+                    if segment.read_position == segment.write_position:
+                        if (
+                            segment.sealed
+                            or len(self._segments) > 1
+                            or self._sealed
+                        ):
+                            self._segments.popleft()
+                            self._dispose_segment(segment)
+                        else:
+                            segment.file.seek(0)
+                            segment.file.truncate(0)
+                            segment.read_position = 0
+                            segment.write_position = 0
+                return b"".join(chunks)
+
+            if self._error is not None:
+                raise self._error
+            return b""
+
+    def close(self) -> None:
+        with self._condition:
+            if self._closed:
+                self._retry_pending_unlinks(final=True)
+                return
+            self._closed = True
+            self._sealed = True
+            self._condition.notify_all()
+            while self._segments:
+                self._dispose_segment(self._segments.popleft())
+            self._buffered_size = 0
+            self._retry_pending_unlinks(final=True)
 
 
 def _resp_ok(response) -> bool:
     return response == b"OK" or response == "OK"
 
 
+def _parse_psync_header(response) -> Tuple[str, Optional[str], Optional[int]]:
+    if isinstance(response, bytes):
+        text = response.decode("latin-1")
+    elif isinstance(response, str):
+        text = response
+    else:
+        raise ReplicationProtocolError(f"invalid PSYNC response {response!r}")
+
+    parts = text.strip().lstrip("+").split()
+    if len(parts) >= 3 and parts[0] == "FULLRESYNC":
+        try:
+            return "FULLRESYNC", parts[1], int(parts[2])
+        except ValueError as exc:
+            raise ReplicationProtocolError("invalid FULLRESYNC offset") from exc
+    if parts and parts[0] == "CONTINUE":
+        return "CONTINUE", parts[1] if len(parts) > 1 else None, None
+    raise ReplicationProtocolError(f"unexpected PSYNC response {text!r}")
+
+
 class PSyncIncrementalHandler:
-    """使用PSYNC协议实现实时增量同步"""
-    
-    def __init__(self, source_client: redis.Redis, buffer_size: int = 8192):
-        """
-        初始化PSYNC增量处理器
-        
-        参数:
-            source_client: 源Redis客户端
-            buffer_size: 缓冲区大小
-        """
+    """Consume a Redis replication stream with committed-offset ACKs."""
+
+    CAPTURE_MEMORY_SIZE = 8 * 1024 * 1024
+    CAPTURE_MAX_SIZE = 1024 * 1024 * 1024
+    MAX_RETRIES = 999
+    RETRY_DELAY = 5.0
+
+    def __init__(
+        self,
+        source_client: redis.Redis,
+        buffer_size: int = 8192,
+        snapshot_callback: Optional[Callable[[bytes], object]] = None,
+        listening_port: int = 6380,
+        ack_interval: float = 1.0,
+        materialize_snapshot: bool = True,
+        capture_max_size: Optional[int] = None,
+    ):
         self.source_client = source_client
-        self.buffer_size = buffer_size
+        self.buffer_size = int(buffer_size)
+        if not 1 <= self.buffer_size <= MAX_REPLICATION_BUFFER_SIZE:
+            raise ValueError(
+                "buffer_size must be between 1 and "
+                f"{MAX_REPLICATION_BUFFER_SIZE} bytes"
+            )
+        self.snapshot_callback = snapshot_callback
+        self.listening_port = listening_port
+        self.ack_interval = max(0.01, float(ack_interval))
+        self.materialize_snapshot = bool(materialize_snapshot)
+        self.capture_max_size = int(
+            self.CAPTURE_MAX_SIZE
+            if capture_max_size is None
+            else capture_max_size
+        )
+        if self.capture_max_size < 1:
+            raise ValueError("capture_max_size must be positive")
+
         self.running = False
         self.replication_thread: Optional[threading.Thread] = None
         self.replication_id: Optional[str] = None
+        # Public offset is the last byte whose complete command was delivered.
         self.replication_offset: int = -1
-        
-    def start_replication(self, command_callback: Callable[[List[bytes]], None]):
-        """
-        启动PSYNC实时复制
+        # Received bytes may be ahead of the committed offset.  Their exact
+        # contents stay in _pending_buffer across a reconnect.
+        self._received_offset: int = -1
+        self._pending_buffer = bytearray()
+        self.last_error: Optional[BaseException] = None
 
-        参数:
-            command_callback: 接收到命令时的回调函数，参数为命令列表
+        self._stop_event = threading.Event()
+        self._active_connection = None
+        self._connection_lock = threading.Lock()
+        self._ack_send_lock = threading.Lock()
+        self._connection_workers = {}
+        self._deferred_releases = set()
+
+    @property
+    def received_offset(self) -> int:
+        return self._received_offset
+
+    @property
+    def pending_buffer(self) -> bytes:
+        return bytes(self._pending_buffer)
+
+    def _take_pending_buffer(self) -> bytearray:
+        pending = self._pending_buffer
+        self._pending_buffer = bytearray()
+        if isinstance(pending, bytearray):
+            return pending
+        return bytearray(pending)
+
+    def _assemble_pending_buffer(self, prefetched: bytearray) -> bytearray:
+        pending_size = len(self._pending_buffer)
+        if pending_size + len(prefetched) > MAX_REPLICATION_PENDING_SIZE:
+            raise ReplicationProtocolError(
+                "replication pending buffer exceeds replication limit"
+            )
+        pending = self._take_pending_buffer()
+        if not pending:
+            return prefetched
+        try:
+            pending.extend(prefetched)
+            prefetched.clear()
+        except Exception:
+            del pending[pending_size:]
+            self._pending_buffer = pending
+            raise
+        return pending
+
+    @staticmethod
+    def _take_reader_buffer(reader) -> bytearray:
+        take_ownership = getattr(reader, 'take_buffer_ownership', None)
+        if callable(take_ownership):
+            return take_ownership()
+        return bytearray(reader.pending_bytes)
+
+    def start_replication(
+        self,
+        command_callback: Callable[[List[bytes]], object],
+        snapshot_callback: Optional[Callable[[bytes], object]] = None,
+    ):
+        """Start background replication.
+
+        A FULLRESYNC must be applied by ``snapshot_callback``.  Returning
+        ``False`` from either callback leaves the corresponding data
+        uncommitted.  Legacy callbacks that return ``None`` count as success.
         """
-        if self.running:
-            logger.warning("⚠️  PSYNC复制已在运行")
-            return
+
+        if self.running or (
+            self.replication_thread is not None
+            and self.replication_thread.is_alive()
+        ):
+            logger.warning("PSYNC replication is already running")
+            return False
+        if snapshot_callback is not None:
+            self.snapshot_callback = snapshot_callback
 
         self.running = True
-
-        logger.info("=" * 60)
-        logger.info("🚀 启动 PSYNC 实时复制")
-        logger.info("=" * 60)
-        logger.info(f"📊 Buffer 大小: {self.buffer_size} 字节")
-        logger.info(f"📊 回调函数: {command_callback.__name__ if hasattr(command_callback, '__name__') else 'lambda'}")
-        try:
-            host = self.source_client.connection_pool.connection_kwargs.get('host', 'unknown')
-            port = self.source_client.connection_pool.connection_kwargs.get('port', 'unknown')
-            logger.info(f"📊 源 Redis: {host}:{port}")
-        except Exception:
-            logger.info("📊 源 Redis: (无法获取连接信息)")
-        logger.info("=" * 60)
-
-        # 启动复制线程
-        logger.info("🔧 创建后台复制线程...")
+        self.last_error = None
+        self._stop_event.clear()
         self.replication_thread = threading.Thread(
             target=self._replication_loop,
             args=(command_callback,),
             name="psync-replication",
-            daemon=True
+            daemon=True,
         )
         self.replication_thread.start()
-        logger.info(f"✅ 后台复制线程已启动: {self.replication_thread.name}")
-        logger.info("=" * 60)
-    
-    def stop_replication(self):
-        """停止PSYNC复制"""
-        if not self.running:
-            return
-        
-        self.running = False
-        
-        if self.replication_thread:
-            self.replication_thread.join(timeout=10)
-        
-        logger.info("🛑 PSYNC实时复制已停止")
-    
-    def _replication_loop(self, command_callback: Callable[[List[bytes]], None]):
-        """PSYNC 复制主循环：单连接完成 PING → REPLCONF* → PSYNC → 命令流。"""
-        retry_count = 0
-        max_retries = 999  # 几乎无限重试
-        retry_delay = 5  # 秒
+        return True
 
-        logger.info("=" * 60)
-        logger.info("🔄 进入 PSYNC 复制主循环")
-        logger.info(f"📊 最大重试次数: {max_retries}")
-        logger.info(f"📊 重试延迟: {retry_delay} 秒")
-        logger.info("=" * 60)
+    def stop_replication(self):
+        """Stop replication and interrupt any blocking RDB/socket read."""
+
+        self.running = False
+        self._stop_event.set()
+        with self._connection_lock:
+            connection = self._active_connection
+        if connection is not None:
+            try:
+                connection.disconnect()
+            except Exception:
+                pass
+        if (
+            self.replication_thread
+            and self.replication_thread is not threading.current_thread()
+        ):
+            self.replication_thread.join(timeout=10)
+
+    def _set_active_connection(self, connection) -> bool:
+        with self._connection_lock:
+            if not self.running or self._stop_event.is_set():
+                return False
+            self._active_connection = connection
+            return True
+
+    def _register_connection_worker(self, connection, thread) -> None:
+        with self._connection_lock:
+            self._connection_workers.setdefault(id(connection), set()).add(thread)
+
+    def _unregister_connection_worker(self, connection, thread) -> None:
+        with self._connection_lock:
+            workers = self._connection_workers.get(id(connection))
+            if workers is None:
+                return
+            workers.discard(thread)
+            if not workers:
+                self._connection_workers.pop(id(connection), None)
+
+    def _release_connection_after_workers(self, pool, connection, workers) -> None:
+        connection_id = id(connection)
+
+        def release_when_idle() -> None:
+            try:
+                for worker in workers:
+                    worker.join()
+            finally:
+                with self._connection_lock:
+                    self._connection_workers.pop(connection_id, None)
+                    self._deferred_releases.discard(connection_id)
+            try:
+                pool.release(connection)
+            except Exception:
+                pass
+
+        threading.Thread(
+            target=release_when_idle,
+            name="psync-deferred-connection-release",
+            daemon=True,
+        ).start()
+
+    def _disconnect_and_release(self, pool, connection) -> None:
+        if connection is None:
+            return
+        connection_id = id(connection)
+        with self._connection_lock:
+            if self._active_connection is connection:
+                self._active_connection = None
+            workers = [
+                thread
+                for thread in self._connection_workers.get(connection_id, set())
+                if thread.is_alive()
+            ]
+            already_deferred = connection_id in self._deferred_releases
+            if workers and not already_deferred:
+                self._deferred_releases.add(connection_id)
+        try:
+            connection.disconnect()
+        except Exception:
+            pass
+        if already_deferred:
+            return
+        if workers:
+            self._release_connection_after_workers(pool, connection, workers)
+            return
+        try:
+            pool.release(connection)
+        except Exception:
+            pass
+
+    def _read_ok(self, connection, reader, *command) -> None:
+        connection.send_command(*command, check_health=False)
+        response = reader.read_response()
+        if not _resp_ok(response):
+            raise ReplicationProtocolError(
+                f"{' '.join(map(str, command))} returned {response!r}"
+            )
+
+    def _perform_handshake(self, connection, reader) -> None:
+        connection.send_command("PING", check_health=False)
+        pong = reader.read_response()
+        if pong not in (b"PONG", "PONG", True):
+            raise ReplicationProtocolError(f"PING returned {pong!r}")
+        self._read_ok(
+            connection,
+            reader,
+            "REPLCONF",
+            "listening-port",
+            self.listening_port,
+        )
+        self._read_ok(connection, reader, "REPLCONF", "capa", "eof")
+        self._read_ok(connection, reader, "REPLCONF", "capa", "psync2")
+
+    def _apply_snapshot(self, rdb_data: bytes) -> None:
+        callback = self.snapshot_callback
+        if callback is None:
+            raise SnapshotRequiredError(
+                "FULLRESYNC requires a snapshot_callback; the RDB was not discarded"
+            )
+        result = callback(rdb_data)
+        if result is False:
+            raise RuntimeError("snapshot callback reported failure")
+
+    def _apply_snapshot_with_retry(self, rdb_data: bytes) -> None:
+        while self.running and not self._stop_event.is_set():
+            try:
+                self._apply_snapshot(rdb_data)
+                return
+            except SnapshotRequiredError:
+                raise
+            except Exception as exc:
+                self.last_error = exc
+                logger.error("snapshot callback failed: %s", exc)
+                if self._stop_event.wait(
+                    max(0.05, min(self.ack_interval, 1.0))
+                ):
+                    raise _ReplicationStopped
+        raise _ReplicationStopped
+
+    def _record_received(self, size: int) -> None:
+        if self._received_offset < 0:
+            raise ReplicationProtocolError("received stream bytes before base offset")
+        self._received_offset += size
+
+    def _start_snapshot_stream_capture(self, connection):
+        """Keep draining the socket while callbacks consume a disk-backed stream."""
+        capture = _DiskBackedCapture(
+            self.CAPTURE_MEMORY_SIZE,
+            self.capture_max_size,
+        )
+        stop_event = threading.Event()
+        errors = []
+
+        def drain() -> None:
+            capture_error = None
+            try:
+                try:
+                    connection._sock.settimeout(min(self.ack_interval, 0.1))
+                except Exception:
+                    pass
+                while not stop_event.is_set():
+                    try:
+                        data = connection._sock.recv(self.buffer_size)
+                    except socket.timeout:
+                        continue
+                    except Exception as exc:
+                        capture_error = ReplicationConnectionClosed(
+                            f"replication socket read failed: {exc}"
+                        )
+                        errors.append(capture_error)
+                        return
+                    if not data:
+                        capture_error = ReplicationConnectionClosed(
+                            "replication connection closed during snapshot alignment"
+                        )
+                        errors.append(capture_error)
+                        return
+                    try:
+                        capture.append(data)
+                    except Exception as exc:
+                        capture_error = RuntimeError(
+                            f"failed to spool replication backlog: {exc}"
+                        )
+                        errors.append(capture_error)
+                        try:
+                            connection.disconnect()
+                        except Exception:
+                            pass
+                        capture.seal(capture_error)
+                        capture.close()
+                        return
+            finally:
+                capture.seal(capture_error)
+                self._unregister_connection_worker(
+                    connection, threading.current_thread()
+                )
+
+        thread = threading.Thread(
+            target=drain,
+            name="psync-snapshot-stream-capture",
+            daemon=True,
+        )
+        self._register_connection_worker(connection, thread)
+        thread.start()
+        return capture, stop_event, errors, thread, connection
+
+    @staticmethod
+    def _stop_snapshot_stream_capture(capture_state) -> None:
+        _capture, stop_event, _errors, thread, connection = capture_state
+        stop_event.set()
+        thread.join(timeout=_WORKER_JOIN_TIMEOUT)
+        forced_disconnect = thread.is_alive()
+        if thread.is_alive():
+            try:
+                connection.disconnect()
+            except Exception:
+                pass
+            thread.join(timeout=_WORKER_JOIN_TIMEOUT)
+        if thread.is_alive():
+            raise RuntimeError("snapshot stream capture did not stop promptly")
+        if forced_disconnect:
+            raise ReplicationConnectionClosed(
+                "snapshot stream capture required disconnect to stop"
+            )
+
+    @staticmethod
+    def _close_capture_after_worker(capture, thread) -> None:
+        def close_when_idle() -> None:
+            thread.join()
+            capture.close()
+
+        threading.Thread(
+            target=close_when_idle,
+            name="psync-deferred-capture-close",
+            daemon=True,
+        ).start()
+
+    @contextmanager
+    def _captured_replication_stream(self, connection):
+        capture_state = self._start_snapshot_stream_capture(connection)
+        capture = capture_state[0]
+        try:
+            yield capture_state
+        finally:
+            try:
+                self._stop_snapshot_stream_capture(capture_state)
+            finally:
+                if capture_state[3].is_alive():
+                    self._close_capture_after_worker(capture, capture_state[3])
+                else:
+                    capture.close()
+
+    def _ensure_running(self) -> None:
+        if not self.running or self._stop_event.is_set():
+            raise _ReplicationStopped
+
+    @contextmanager
+    def _ack_heartbeat(self, connection):
+        """Send committed-offset ACKs independently of reads and callbacks."""
+        stop_event = threading.Event()
+        errors = []
+
+        def send_acks() -> None:
+            try:
+                while self.running and not stop_event.is_set():
+                    try:
+                        self._send_replconf_ack(connection)
+                    except Exception as exc:
+                        errors.append(exc)
+                        self.last_error = exc
+                        try:
+                            connection.disconnect()
+                        except Exception:
+                            pass
+                        return
+                    if stop_event.wait(self.ack_interval):
+                        return
+            finally:
+                self._unregister_connection_worker(
+                    connection, threading.current_thread()
+                )
+
+        thread = threading.Thread(
+            target=send_acks,
+            name="psync-ack-heartbeat",
+            daemon=True,
+        )
+        self._register_connection_worker(connection, thread)
+        thread.start()
+        try:
+            yield errors
+        finally:
+            stop_event.set()
+            thread.join(timeout=_WORKER_JOIN_TIMEOUT)
+            forced_disconnect = thread.is_alive()
+            if forced_disconnect:
+                try:
+                    connection.disconnect()
+                except Exception:
+                    pass
+                thread.join(timeout=_WORKER_JOIN_TIMEOUT)
+                errors.append(
+                    ReplicationConnectionClosed(
+                        "ACK heartbeat required disconnect to stop"
+                    )
+                )
+            if thread.is_alive():
+                errors.append(RuntimeError("ACK heartbeat did not stop promptly"))
+
+    def _replication_loop(self, command_callback: Callable[[List[bytes]], object]):
+        retry_count = 0
+        max_retries = self.MAX_RETRIES
+        retry_delay = self.RETRY_DELAY
 
         while self.running and retry_count < max_retries:
+            if retry_count and self._stop_event.wait(retry_delay):
+                break
+
+            pool = self.source_client.connection_pool
+            connection = None
             try:
-                if retry_count > 0:
-                    logger.info("=" * 60)
-                    logger.info(f"🔄 尝试重新连接 PSYNC... (第 {retry_count} 次)")
-                    logger.info(f"⏱️  等待 {retry_delay} 秒...")
-                    logger.info("=" * 60)
-                    time.sleep(retry_delay)
-                else:
-                    logger.info("=" * 60)
-                    logger.info("🔄 开始第一次连接...")
-                    logger.info("=" * 60)
-
-                pool = self.source_client.connection_pool
                 connection = pool.get_connection("PSYNC")
-                logger.info("📡 单连接: PING → REPLCONF → PSYNC")
-
-                try:
-                    connection.send_command("PING")
-                    pong = connection.read_response()
-                    if pong not in (b"PONG", "PONG", True):
-                        logger.error("❌ PING 失败: %r", pong)
-                        retry_count += 1
-                        continue
-
-                    connection.send_command("REPLCONF", "listening-port", 6380)
-                    r1 = connection.read_response()
-                    if not _resp_ok(r1):
-                        logger.error("❌ REPLCONF listening-port 失败: %r", r1)
-                        retry_count += 1
-                        continue
-
-                    connection.send_command("REPLCONF", "capa", "eof")
-                    r2 = connection.read_response()
-                    if not _resp_ok(r2):
-                        logger.error("❌ REPLCONF capa eof 失败: %r", r2)
-                        retry_count += 1
-                        continue
-
-                    connection.send_command("REPLCONF", "capa", "psync2")
-                    r3 = connection.read_response()
-                    if not _resp_ok(r3):
-                        logger.error("❌ REPLCONF capa psync2 失败: %r", r3)
-                        retry_count += 1
-                        continue
-
-                    if self.replication_id and self.replication_offset >= 0:
-                        logger.info(
-                            "📡 发送 PSYNC %s %s",
-                            self.replication_id,
-                            self.replication_offset,
-                        )
-                        connection.send_command(
-                            "PSYNC", self.replication_id, self.replication_offset
-                        )
-                    else:
-                        logger.info("📡 发送 PSYNC ? -1")
-                        connection.send_command("PSYNC", "?", "-1")
-
-                    response = connection.read_response()
-                    logger.info("📥 PSYNC响应: %s (类型: %s)", response, type(response))
-
-                    if isinstance(response, bytes):
-                        response_str = response.decode("utf-8", errors="surrogateescape")
-                    elif isinstance(response, str):
-                        response_str = response
-                    else:
-                        logger.error("❌ 未知的PSYNC响应类型: %s", type(response))
-                        retry_count += 1
-                        continue
-
-                    if response_str.startswith("FULLRESYNC"):
-                        parts = response_str.split()
-                        self.replication_id = parts[1]
-                        self.replication_offset = int(parts[2])
-                        logger.info(
-                            "📦 全量同步头: repl_id=%s offset=%s",
-                            self.replication_id,
-                            self.replication_offset,
-                        )
-                        self._skip_rdb_data(connection)
-                    elif response_str.startswith("CONTINUE"):
-                        logger.info("⚡ 继续部分同步")
-                    else:
-                        logger.error("❌ 未知的PSYNC响应: %s", response_str)
-                        retry_count += 1
-                        continue
-
-                    logger.info("🔄 开始接收实时命令流...")
-                    retry_count = 0
-                    self._receive_command_stream(connection, command_callback)
-
-                    if self.running:
-                        logger.warning("⚠️  连接断开，准备重连...")
-                        retry_count += 1
-
-                finally:
-                    try:
-                        pool.release(connection)
-                    except Exception:
-                        pass
-
-            except Exception as e:
-                if self.running:
-                    logger.error(f"❌ PSYNC复制异常: {e}", exc_info=True)
-                    retry_count += 1
-                else:
+                if not self._set_active_connection(connection):
+                    self._disconnect_and_release(pool, connection)
+                    connection = None
                     break
+                reader = ReplicationStreamReader(
+                    connection._sock, buffer_size=self.buffer_size
+                )
+                self._ensure_running()
+                self._perform_handshake(connection, reader)
+                self._ensure_running()
 
-        if retry_count >= max_retries:
-            logger.error(f"❌ PSYNC 重连失败次数过多 ({max_retries} 次)，停止重连")
-        else:
-            logger.info("✅ PSYNC 复制已停止")
-    
-    def _skip_rdb_data(self, connection):
-        """跳过RDB数据（因为已经做过全量同步）"""
-        try:
-            # 设置 socket 超时（300秒，足够传输大的 RDB）
-            connection._sock.settimeout(300)
-            logger.debug("📊 Socket 超时设置为 300 秒（用于 RDB 传输）")
-
-            # 读取RDB大小（逐字节读取，避免读取过多）
-            size_line = b''
-            first_byte = connection._sock.recv(1)
-            if not first_byte:
-                logger.warning("⚠️  读取RDB大小时连接断开（第一个字节为空）")
-                return
-
-            size_line += first_byte
-            logger.debug(f"📊 RDB 第一个字节: {first_byte.hex()} ('{chr(first_byte[0]) if 32 <= first_byte[0] < 127 else '?'}')")
-
-            if first_byte[0] == ord('$'):
-                # Bulk string格式: $<size>\r\n<data>
-                # 逐字节读取直到 \r\n
-                logger.debug("📡 读取 RDB 大小...")
-                while not size_line.endswith(b'\r\n'):
-                    byte = connection._sock.recv(1)
-                    if not byte:
-                        logger.error("❌ 读取RDB大小时连接断开")
-                        return
-                    size_line += byte
-
-                # 解析大小
-                size_str = size_line[1:-2]  # 去掉 $ 和 \r\n
-                rdb_size = int(size_str)
-
-                logger.info(f"📦 RDB 大小: {rdb_size} 字节 ({rdb_size / 1024 / 1024:.2f} MB)")
-                logger.info(f"🔄 开始跳过 RDB 数据...")
-
-                # 跳过RDB数据
-                remaining = rdb_size
-                skipped = 0
-                start_time = time.time()
-                last_log_time = start_time
-
-                while remaining > 0:
-                    chunk_size = min(remaining, self.buffer_size)
-                    chunk = connection._sock.recv(chunk_size)
-                    if not chunk:
-                        logger.warning(f"⚠️  跳过RDB数据时连接断开，已跳过 {skipped}/{rdb_size} 字节")
-                        break
-                    remaining -= len(chunk)
-                    skipped += len(chunk)
-
-                    # 每跳过 10MB 或每 5 秒记录一次进度
-                    current_time = time.time()
-                    if skipped % (10 * 1024 * 1024) < self.buffer_size or current_time - last_log_time >= 5:
-                        elapsed = current_time - start_time
-                        speed = skipped / elapsed / 1024 / 1024 if elapsed > 0 else 0
-                        logger.info(f"📊 已跳过 {skipped}/{rdb_size} 字节 ({skipped*100//rdb_size}%)，速度: {speed:.2f} MB/s")
-                        last_log_time = current_time
-
-                elapsed = time.time() - start_time
-                speed = skipped / elapsed / 1024 / 1024 if elapsed > 0 else 0
-                logger.info(f"✅ RDB数据已跳过: {skipped}/{rdb_size} 字节，耗时 {elapsed:.1f} 秒，平均速度: {speed:.2f} MB/s")
-
-                # RESP 标准 bulk 在 N 字节体后可有 \r\n，但 Redis 主从复制里 RDB 块后
-                # 很多版本直接接命令流（以 * 开头），并不再发尾 \r\n。
-                # 若盲目 recv(2) 会误吞 *1 等命令头导致解析错位，故仅 PEEK 到 \r\n 才消费。
-                try:
-                    peek = connection._sock.recv(2, socket.MSG_PEEK)
-                except OSError:
-                    peek = b""
-                if peek == b"\r\n":
-                    connection._sock.recv(2)
-                    logger.debug("📡 已跳过 RDB bulk 尾 \\r\\n")
-                elif peek:
-                    logger.debug(
-                        "📡 RDB 后下一帧为 %r（无主库 bulk 尾 \\r\\n 属正常），命令流从此接续",
-                        peek,
+                last_received_offset = self._received_offset
+                if last_received_offset < 0:
+                    last_received_offset = self.replication_offset
+                if self.replication_id and last_received_offset >= 0:
+                    connection.send_command(
+                        "PSYNC", self.replication_id, last_received_offset + 1,
+                        check_health=False,
                     )
+                else:
+                    connection.send_command("PSYNC", "?", -1, check_health=False)
 
-                logger.debug("📡 RDB 跳过完成，准备接收命令流")
+                kind, replid, initial_offset = _parse_psync_header(
+                    reader.read_response()
+                )
+                self._ensure_running()
+                if kind == "FULLRESYNC":
+                    if replid is None or initial_offset is None:
+                        raise ReplicationProtocolError(
+                            "FULLRESYNC omitted replication metadata"
+                        )
+                    # The old history can no longer be resumed. Until the new
+                    # snapshot commits, heartbeat with offset zero only.
+                    self.replication_id = None
+                    self.replication_offset = -1
+                    self._received_offset = -1
+                    self._pending_buffer = bytearray()
 
-            else:
-                logger.warning(f"⚠️  意外的 RDB 第一个字节: {first_byte.hex()} (期望 '$' = 0x24)")
+                with self._ack_heartbeat(connection) as ack_errors:
+                    if kind == "FULLRESYNC":
+                        rdb_data = reader.read_rdb(
+                            collect=self.materialize_snapshot
+                        )
+                    else:
+                        if replid is not None:
+                            self.replication_id = replid
+                        if self._received_offset < 0:
+                            self._received_offset = max(
+                                self.replication_offset, 0
+                            )
+                    prefetched = reader.take_buffer_ownership()
+                    self._ensure_running()
 
-        except socket.timeout:
-            logger.error(f"❌ 跳过RDB数据超时（300秒）")
-        except Exception as e:
-            logger.error(f"❌ 跳过RDB数据失败: {e}", exc_info=True)
-    
-    def _receive_command_stream(self, connection, command_callback: Callable[[List[bytes]], None]):
-        """接收并处理命令流（带 REPLCONF ACK 心跳）"""
-        buffer = b''
-        command_count = 0
-        last_log_time = time.time()
-        last_data_time = time.time()
-        last_ack_time = time.time()  # 新增：上次发送 ACK 的时间
-        data_received_count = 0
-        ack_interval = 1.0  # 新增：ACK 心跳间隔（1 秒）
+                    with self._captured_replication_stream(
+                        connection
+                    ) as capture_state:
+                        captured_stream, _, capture_errors, _, _ = capture_state
+                        if kind == "FULLRESYNC":
+                            self._ensure_running()
+                            self._apply_snapshot_with_retry(rdb_data)
+                            self._ensure_running()
+                            self.replication_id = replid
+                            self.replication_offset = initial_offset
+                            self._received_offset = initial_offset
 
-        logger.info("=" * 60)
-        logger.info("📡 开始监听命令流（带 REPLCONF ACK 心跳）...")
-        logger.info(f"📊 Socket 超时设置: 1 秒（用于心跳）")
-        logger.info(f"📊 Buffer 大小: {self.buffer_size} 字节")
-        logger.info(f"📊 ACK 心跳间隔: {ack_interval} 秒")
-        logger.info(f"📊 回调函数: {command_callback.__name__ if hasattr(command_callback, '__name__') else 'lambda'}")
-        logger.info("=" * 60)
+                        initial_buffer = self._assemble_pending_buffer(prefetched)
+                        stream_reader = ReplicationStreamReader(
+                            connection._sock,
+                            buffer_size=self.buffer_size,
+                            initial_buffer=initial_buffer,
+                            initial_stream=captured_stream,
+                            allow_leading_crlf=(kind == "FULLRESYNC"),
+                            adopt_initial_buffer=True,
+                        )
+                        self._received_offset = (
+                            self.replication_offset
+                            + stream_reader.pending_size
+                        )
+                        retry_count = 0
+                        # The PSYNC handshake (and FULLRESYNC callback, when
+                        # present) has recovered the stream. Do not leave a
+                        # previous connection failure visible as current state.
+                        self.last_error = None
+                        stream_ok = self._receive_command_stream(
+                            connection,
+                            command_callback,
+                            reader=stream_reader,
+                            _manage_ack=False,
+                            _retry_callbacks=True,
+                        )
+                    if capture_errors:
+                        self.last_error = capture_errors[0]
+                        if self.running:
+                            stream_ok = False
+                    if ack_errors:
+                        raise ack_errors[0]
+                    if self.running and not stream_ok:
+                        retry_count += 1
+
+            except _ReplicationStopped:
+                pass
+            except SnapshotRequiredError as exc:
+                self.last_error = exc
+                logger.error("PSYNC stopped: %s", exc)
+                self.running = False
+            except Exception as exc:
+                self.last_error = exc
+                if self.running:
+                    logger.error("PSYNC replication failed: %s", exc, exc_info=True)
+                    retry_count += 1
+            finally:
+                self._disconnect_and_release(pool, connection)
+
+        self.running = False
+
+    def _skip_rdb_data(self, connection):
+        """Legacy helper retained as an explicit snapshot operation."""
+
+        reader = ReplicationStreamReader(
+            connection._sock, buffer_size=self.buffer_size
+        )
+        rdb_data = reader.read_rdb(collect=self.materialize_snapshot)
+        self._apply_snapshot(rdb_data)
+        return reader.take_buffer()
+
+    def _receive_command_stream(
+        self,
+        connection,
+        command_callback: Callable[[List[bytes]], object],
+        reader: Optional[ReplicationStreamReader] = None,
+        _manage_ack: bool = True,
+        _retry_callbacks: bool = False,
+    ) -> bool:
+        """Deliver complete frames and ACK only their committed offsets."""
+
+        if reader is None:
+            initial_buffer = self._take_pending_buffer()
+            reader = ReplicationStreamReader(
+                connection._sock,
+                buffer_size=self.buffer_size,
+                initial_buffer=initial_buffer,
+                adopt_initial_buffer=True,
+            )
+
+        if _manage_ack:
+            with self._ack_heartbeat(connection) as ack_errors:
+                result = self._receive_command_stream(
+                    connection,
+                    command_callback,
+                    reader=reader,
+                    _manage_ack=False,
+                    _retry_callbacks=_retry_callbacks,
+                )
+            if ack_errors:
+                self.last_error = ack_errors[0]
+                return False
+            return result
+
+        try:
+            connection._sock.settimeout(self.ack_interval)
+        except Exception:
+            pass
 
         while self.running:
             try:
-                # 设置较短的超时，以便定期发送 ACK
-                connection._sock.settimeout(ack_interval)  # 1秒超时
-
-                elapsed_since_last = time.time() - last_data_time
-                logger.debug(f"⏳ 等待接收数据... (距上次数据 {elapsed_since_last:.1f} 秒)")
-
-                data = connection._sock.recv(self.buffer_size)
-                data_received_count += 1
-
-                if not data:
-                    elapsed = time.time() - last_data_time
-                    logger.warning("=" * 60)
-                    logger.warning(f"⚠️  连接关闭（recv返回空数据）")
-                    logger.warning(f"📊 距上次数据: {elapsed:.1f} 秒")
-                    logger.warning(f"📊 已接收数据次数: {data_received_count}")
-                    logger.warning(f"📊 已处理命令数: {command_count}")
-                    logger.warning("=" * 60)
-                    break
-
-                last_data_time = time.time()
-
-                # 新增：更新复制偏移量（重要！）
-                self.replication_offset += len(data)
-
-                logger.debug(
-                    "📥 收到数据 #%s: %s 字节 (offset: %s)",
-                    data_received_count,
-                    len(data),
-                    self.replication_offset,
+                command, consumed = reader.peek_command()
+                self._received_offset = (
+                    self.replication_offset + reader.pending_size
                 )
-                logger.debug("📊 数据前 50 字节（hex）: %s", data[:50].hex())
-                logger.debug("📊 数据前 50 字节（repr）: %s", repr(data[:50]))
-
-                buffer += data
-                logger.debug(f"📊 当前 buffer 大小: {len(buffer)} 字节")
-
-                # 解析命令
-                parsed_count = 0
-                while buffer:
-                    command, remaining = parse_resp_array_command(buffer)
-                    if command is None:
-                        logger.debug(
-                            "⏸️  数据不完整，等待更多数据（当前 buffer: %s 字节）",
-                            len(buffer),
-                        )
-                        logger.debug("📊 Buffer 前 100 字节（hex）: %s", buffer[:100].hex())
-                        logger.debug("📊 Buffer 前 100 字节（repr）: %s", repr(buffer[:100]))
+                while True:
+                    callback_error = None
+                    try:
+                        delivered = command_callback(command)
+                    except Exception as exc:
+                        delivered = False
+                        callback_error = exc
+                        logger.error("replication command callback failed: %s", exc)
+                    if delivered is not False:
                         break
 
-                    buffer = remaining
-                    parsed_count += 1
-
-                    # 处理命令
-                    if command:
-                        try:
-                            command_count += 1
-
-                            # 记录命令详情
-                            cmd_name = command[0].decode('utf-8', errors='ignore') if command else 'UNKNOWN'
-                            cmd_args_str = ' '.join([c.decode('utf-8', errors='ignore')[:50] for c in command[:3]])
-                            if len(command) > 3:
-                                cmd_args_str += f" ... (共{len(command)}个参数)"
-
-                            logger.debug("🔧 解析命令 #%s: %s %s", command_count, cmd_name, cmd_args_str)
-                            logger.debug(
-                                "📊 命令完整内容: %s",
-                                [c.decode("utf-8", errors="ignore") for c in command],
-                            )
-
-                            logger.debug("📞 调用回调处理命令 #%s...", command_count)
-                            command_callback(command)
-
-                            current_time = time.time()
-                            if current_time - last_log_time >= 10 or command_count % 100 == 0:
-                                logger.info("📊 已处理 %s 个命令", command_count)
-                                last_log_time = current_time
-
-                        except Exception as e:
-                            logger.error(f"❌ 命令回调失败: {e}", exc_info=True)
-
-                if parsed_count > 0:
-                    logger.debug(
-                        "📊 本次接收解析了 %s 个命令，剩余 buffer: %s 字节",
-                        parsed_count,
-                        len(buffer),
+                    self.last_error = callback_error or RuntimeError(
+                        "replication command callback reported failure"
                     )
+                    if not _retry_callbacks:
+                        self._pending_buffer = self._take_reader_buffer(reader)
+                        return False
+                    if not self.running or self._stop_event.wait(
+                        max(0.05, min(self.ack_interval, 1.0))
+                    ):
+                        self._pending_buffer = self._take_reader_buffer(reader)
+                        return True
+
+                reader.commit(consumed)
+                self.replication_offset += consumed
+                self._received_offset = (
+                    self.replication_offset + reader.pending_size
+                )
+                if is_replconf_getack(command):
+                    self._send_replconf_ack(connection)
 
             except socket.timeout:
-                # 超时是正常的，用于发送 ACK
-                elapsed = time.time() - last_data_time
-                logger.debug(f"⏱️  接收超时（正常），距上次数据: {elapsed:.1f} 秒")
-            except Exception as e:
-                if self.running:
-                    logger.error("=" * 60)
-                    logger.error(f"❌ 接收命令流失败: {e}", exc_info=True)
-                    logger.error("=" * 60)
-                break
+                self._received_offset = (
+                    self.replication_offset + reader.pending_size
+                )
+            except ReplicationConnectionClosed as exc:
+                self.last_error = exc
+                reader.discard_partial_snapshot_terminator()
+                self._received_offset = (
+                    self.replication_offset + reader.pending_size
+                )
+                self._pending_buffer = self._take_reader_buffer(reader)
+                return False
+            except Exception as exc:
+                self.last_error = exc
+                self._received_offset = (
+                    self.replication_offset + reader.pending_size
+                )
+                self._pending_buffer = self._take_reader_buffer(reader)
+                logger.error("replication command stream failed: %s", exc)
+                return False
 
-            # 新增：定期发送 REPLCONF ACK 心跳（重要！）
-            current_time = time.time()
-            if current_time - last_ack_time >= ack_interval:
-                try:
-                    self._send_replconf_ack(connection)
-                    last_ack_time = current_time
-                except Exception as e:
-                    logger.error(f"❌ 发送 REPLCONF ACK 失败: {e}")
-                    break  # ACK 发送失败，断开连接重试
+        self._pending_buffer = self._take_reader_buffer(reader)
+        return True
 
-        logger.info("=" * 60)
-        logger.info(f"✅ 命令流接收结束")
-        logger.info(f"📊 总接收数据次数: {data_received_count}")
-        logger.info(f"📊 总处理命令数: {command_count}")
-        logger.info(f"📊 最终复制偏移量: {self.replication_offset}")
-        logger.info("=" * 60)
-    
     def _send_replconf_ack(self, connection):
-        """
-        发送 REPLCONF ACK 心跳
-
-        格式: *3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$<len>\r\n<offset>\r\n
-        """
-        try:
-            offset_str = str(self.replication_offset)
-            cmd = f"*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n${len(offset_str)}\r\n{offset_str}\r\n"
-
-            connection._sock.sendall(cmd.encode())
-            logger.debug(f"💓 发送 REPLCONF ACK {self.replication_offset}")
-
-        except Exception as e:
-            logger.error(f"❌ 发送 REPLCONF ACK 失败: {e}")
-            raise  # 抛出异常，触发重连
-
+        committed_offset = max(self.replication_offset, 0)
+        with self._ack_send_lock:
+            connection.send_command(
+                "REPLCONF", "ACK", committed_offset, check_health=False
+            )

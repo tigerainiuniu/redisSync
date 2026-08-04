@@ -21,7 +21,7 @@ def read_requirements():
         with open(requirements_path, 'r', encoding='utf-8') as f:
             return [line.strip() for line in f if line.strip() and not line.startswith('#')]
     return [
-        'redis>=4.0.0',
+        'redis>=4.5.0',
         'click>=8.0.0',
         'pyyaml>=6.0',
         'tqdm>=4.60.0'

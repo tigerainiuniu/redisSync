@@ -9,18 +9,35 @@ import redis
 import logging
 import time
 import threading
-from typing import Optional, Callable, Dict, Any, List, Set
+from typing import Optional, Callable, Dict, Any, List, Set, Union
 from datetime import datetime
 from collections import defaultdict
 
 from .exceptions import MigrationError
-from .key_sync import sync_key_with_dump_restore
-from .sync_filters import KeySyncFilter
+from .key_sync import (
+    _is_restore_compatibility_error,
+    _sync_key_fallback,
+    redis_values_equal,
+    restore_dump_with_deadline,
+    source_supports_pexpiretime,
+    sync_key_with_dump_restore,
+)
+from .sync_filters import KeySyncFilter, build_atomic_filtered_delete_command
 logger = logging.getLogger(__name__)
+Key = Union[str, bytes]
+MAX_PIPELINE_KEYS = 200
+
+
+def _key_chunks(keys, batch_size: int = MAX_PIPELINE_KEYS):
+    for offset in range(0, len(keys), batch_size):
+        yield keys[offset:offset + batch_size]
 
 
 class IncrementalMigrationHandler:
     """处理Redis增量迁移的核心类。"""
+
+    SCAN_MAX_RETRIES = 3
+    SCAN_RETRY_DELAY = 0.1
 
     def __init__(self, source_client: redis.Redis, target_client: redis.Redis, scan_count: int = 10000):
         """
@@ -40,6 +57,8 @@ class IncrementalMigrationHandler:
         self.monitor_thread = None
         self.stop_event = threading.Event()
         self._stats_lock = threading.Lock()
+        self._detection_turn_lock = threading.Lock()
+        self._prefer_deletions_next = False
 
         # 增量迁移统计
         self.incremental_stats = {
@@ -153,18 +172,31 @@ class IncrementalMigrationHandler:
         try:
             # 检测变更的键
             logger.info("开始检测变更的键...")
-            changed_keys = self._detect_changed_keys(
-                key_pattern, key_types, sync_timestamp, max_changes
+            detected_changes = self._detect_changed_keys(
+                key_pattern,
+                key_types,
+                sync_timestamp,
+                max_changes,
+                key_filter=key_filter,
+                return_deletions=True,
             )
-
-            if key_filter and changed_keys:
-                changed_keys = key_filter.filter_batch(
-                    self.source_client, list(changed_keys)
-                )
+            if (
+                isinstance(detected_changes, tuple)
+                and len(detected_changes) == 2
+            ):
+                changed_keys, deletion_candidates = detected_changes
+            else:
+                # Preserve compatibility with callers/tests replacing the legacy
+                # detector with a plain list-returning function.
+                changed_keys = detected_changes
+                deletion_candidates = set()
 
             if not changed_keys:
                 logger.info("✓ 未检测到键变更")
                 logger.info("=" * 60)
+                with self._stats_lock:
+                    self.incremental_stats['last_sync_time'] = datetime.now()
+                self.last_sync_time = start_time
                 return {
                     'success': True,
                     'changed_keys': 0,
@@ -181,7 +213,12 @@ class IncrementalMigrationHandler:
 
             # 同步变更的键
             logger.info("开始同步变更的键...")
-            sync_result = self._sync_changed_keys(changed_keys)
+            sync_result = self._sync_changed_keys(
+                changed_keys,
+                deletion_candidates=deletion_candidates,
+                key_types=key_types,
+                key_filter=key_filter,
+            )
 
             logger.info(f"✓ 同步完成:")
             logger.info(f"  成功: {sync_result['synced']} 个")
@@ -191,7 +228,6 @@ class IncrementalMigrationHandler:
                 self.incremental_stats['total_changes'] += len(changed_keys)
                 self.incremental_stats['successful_changes'] += sync_result['synced']
                 self.incremental_stats['failed_changes'] += sync_result['failed']
-                self.incremental_stats['last_sync_time'] = datetime.now()
 
             duration = time.time() - start_time
             with self._stats_lock:
@@ -199,20 +235,32 @@ class IncrementalMigrationHandler:
                 if len(self.incremental_stats['sync_intervals']) > 1000:
                     self.incremental_stats['sync_intervals'] = self.incremental_stats['sync_intervals'][-500:]
 
-            # 更新最后同步时间
-            self.last_sync_time = start_time
+            success = sync_result['failed'] == 0
+            if success:
+                with self._stats_lock:
+                    self.incremental_stats['last_sync_time'] = datetime.now()
+                self.last_sync_time = start_time
 
-            logger.info(f"✓ 增量同步完成，耗时: {duration:.2f} 秒")
+            if success:
+                logger.info(f"✓ 增量同步完成，耗时: {duration:.2f} 秒")
+            else:
+                logger.error(
+                    "✗ 增量同步有 %s 个键失败，保留原同步检查点",
+                    sync_result['failed'],
+                )
             logger.info("=" * 60)
 
-            return {
-                'success': True,
+            result = {
+                'success': success,
                 'changed_keys': len(changed_keys),
                 'synced_keys': sync_result['synced'],
                 'failed_keys': sync_result['failed'],
                 'duration': duration,
-                'sync_timestamp': start_time
+                'sync_timestamp': start_time,
             }
+            if not success:
+                result['error'] = f"{sync_result['failed']} 个键同步失败"
+            return result
 
         except Exception as e:
             logger.error(f"✗ 增量同步失败: {e}", exc_info=True)
@@ -264,7 +312,9 @@ class IncrementalMigrationHandler:
                            key_pattern: str,
                            key_types: Optional[List[str]],
                            since_timestamp: float,
-                           max_changes: int) -> List[str]:
+                           max_changes: int,
+                           key_filter: Optional[KeySyncFilter] = None,
+                           return_deletions: bool = False):
         """
         检测变更的键。
 
@@ -273,39 +323,84 @@ class IncrementalMigrationHandler:
         2. 比较键的值哈希
         3. 扫描所有键并与目标比较
         """
-        changed_keys = []
-
         try:
-            logger.info("策略1: 使用OBJECT IDLETIME检测最近活跃的键")
-            # 策略1: 使用OBJECT IDLETIME检测最近活跃的键
-            idle_changes = self._detect_changes_by_idle_time(
-                key_pattern, key_types, since_timestamp, max_changes
-            )
-            changed_keys.extend(idle_changes)
-            logger.info(f"  空闲时间检测到 {len(idle_changes)} 个变更")
+            if max_changes <= 0:
+                return ([], set()) if return_deletions else []
 
-            # 如果检测到的变更不够，使用策略2: 值比较
-            if len(changed_keys) < max_changes:
-                logger.info("策略2: 使用值比较检测变更")
-                remaining_limit = max_changes - len(changed_keys)
-                additional_changes = self._detect_changes_by_comparison(
-                    key_pattern, key_types, remaining_limit, set(changed_keys)
+            with self._detection_turn_lock:
+                prefer_deletions = self._prefer_deletions_next
+                self._prefer_deletions_next = not prefer_deletions
+
+            # IDLETIME measures reads as well as writes and can consume the
+            # change limit with unchanged hot keys. Compare serialized state
+            # instead so every reported key represents a real divergence.
+            logger.info("使用 DUMP/PTTL 比较检测变更")
+            if max_changes == 1:
+                upsert_budget = 0 if prefer_deletions else 1
+                deletion_budget = 1 - upsert_budget
+            else:
+                smaller_budget = max_changes // 2
+                larger_budget = max_changes - smaller_budget
+                if prefer_deletions:
+                    upsert_budget, deletion_budget = smaller_budget, larger_budget
+                else:
+                    upsert_budget, deletion_budget = larger_budget, smaller_budget
+
+            changed_keys = self._detect_changes_by_comparison(
+                key_pattern, key_types, upsert_budget, set(), key_filter=key_filter
+            ) if upsert_budget else []
+            deleted_keys = self._detect_target_only_keys(
+                key_pattern,
+                key_types,
+                deletion_budget,
+                set(changed_keys),
+                key_filter=key_filter,
+            ) if deletion_budget else []
+
+            remaining_limit = max_changes - len(changed_keys) - len(deleted_keys)
+            if remaining_limit > 0 and len(changed_keys) < upsert_budget:
+                extra_deletions = self._detect_target_only_keys(
+                    key_pattern,
+                    key_types,
+                    remaining_limit,
+                    set(changed_keys) | set(deleted_keys),
+                    key_filter=key_filter,
                 )
-                changed_keys.extend(additional_changes)
-                logger.info(f"  值比较检测到 {len(additional_changes)} 个额外变更")
+                deleted_keys.extend(extra_deletions)
+                remaining_limit -= len(extra_deletions)
+            if remaining_limit > 0 and len(deleted_keys) < deletion_budget:
+                extra_changes = self._detect_changes_by_comparison(
+                    key_pattern,
+                    key_types,
+                    remaining_limit,
+                    set(changed_keys) | set(deleted_keys),
+                    key_filter=key_filter,
+                )
+                changed_keys.extend(extra_changes)
 
-            logger.info(f"总共检测到 {len(changed_keys)} 个变更的键")
-            return changed_keys[:max_changes]
+            logger.info("  值比较检测到 %s 个变更", len(changed_keys))
+            logger.info("  检测到 %s 个源端已删除键", len(deleted_keys))
+            changed_keys.extend(deleted_keys)
+
+            selected_changes = changed_keys[:max_changes]
+            logger.info(f"总共检测到 {len(selected_changes)} 个变更的键")
+            if return_deletions:
+                selected_set = set(selected_changes)
+                return selected_changes, {
+                    key for key in deleted_keys if key in selected_set
+                }
+            return selected_changes
 
         except Exception as e:
             logger.error(f"✗ 检测键变更失败: {e}", exc_info=True)
-            return []
+            raise MigrationError(f"检测键变更失败: {e}") from e
     
     def _detect_changes_by_idle_time(self,
                                    key_pattern: str,
                                    key_types: Optional[List[str]],
                                    since_timestamp: float,
-                                   max_changes: int) -> List[str]:
+                                   max_changes: int,
+                                   key_filter: Optional[KeySyncFilter] = None) -> List[Key]:
         """
         通过空闲时间检测变更的键（使用SCAN避免阻塞 + Pipeline批量检测）
 
@@ -326,11 +421,7 @@ class IncrementalMigrationHandler:
             scan_count = min(1000, self.scan_count)
 
             while len(changed_keys) < max_changes:
-                cursor, keys = self.source_client.scan(
-                    cursor=cursor,
-                    match=key_pattern,
-                    count=scan_count,
-                )
+                cursor, keys = self._scan_page(cursor, key_pattern, scan_count)
                 if not keys:
                     if cursor == 0:
                         break
@@ -339,15 +430,20 @@ class IncrementalMigrationHandler:
                 batch = list(keys)
 
                 if key_types:
-                    pipe = self.source_client.pipeline(transaction=False)
-                    for key in batch:
-                        pipe.type(key)
-                    types = pipe.execute()
                     filtered = []
-                    for i, kt in enumerate(types):
-                        kt_s = kt.decode() if isinstance(kt, bytes) else kt
-                        if kt_s in key_types:
-                            filtered.append(batch[i])
+                    for chunk in _key_chunks(batch):
+                        pipe = self.source_client.pipeline(transaction=False)
+                        for key in chunk:
+                            pipe.type(key)
+                        types = pipe.execute()
+                        for key, key_type in zip(chunk, types):
+                            normalized = (
+                                key_type.decode()
+                                if isinstance(key_type, bytes)
+                                else key_type
+                            )
+                            if normalized in key_types:
+                                filtered.append(key)
                     batch = filtered
 
                 if not batch:
@@ -355,9 +451,14 @@ class IncrementalMigrationHandler:
                         break
                     continue
 
-                pipe_batch = 1000
-                for off in range(0, len(batch), pipe_batch):
-                    sub = batch[off : off + pipe_batch]
+                if key_filter:
+                    batch = list(key_filter.filter_batch(self.source_client, batch))
+                    if not batch:
+                        if cursor == 0:
+                            break
+                        continue
+
+                for sub in _key_chunks(batch):
                     pipe = self.source_client.pipeline(transaction=False)
                     for key in sub:
                         pipe.object("idletime", key)
@@ -367,10 +468,9 @@ class IncrementalMigrationHandler:
                             continue
                         if idle_time <= time_diff + 5:
                             key = sub[i]
-                            key_str = key.decode() if isinstance(key, bytes) else key
-                            changed_keys.append(key_str)
+                            changed_keys.append(key)
                             logger.debug(
-                                "✓ 变更键: %s, idle=%s秒", key_str, idle_time
+                                "✓ 变更键: %r, idle=%s秒", key, idle_time
                             )
                             if len(changed_keys) >= max_changes:
                                 break
@@ -387,13 +487,14 @@ class IncrementalMigrationHandler:
 
         except Exception as e:
             logger.error(f"❌ 检测变更失败: {e}", exc_info=True)
-            return []
+            raise MigrationError(f"IDLETIME 扫描失败: {e}") from e
     
     def _detect_changes_by_comparison(self,
                                     key_pattern: str,
                                     key_types: Optional[List[str]],
                                     max_changes: int,
-                                    exclude_keys: Set[str]) -> List[str]:
+                                    exclude_keys: Set[Key],
+                                    key_filter: Optional[KeySyncFilter] = None) -> List[Key]:
         """
         通过值比较检测变更的键。
 
@@ -401,59 +502,153 @@ class IncrementalMigrationHandler:
         如果键不存在于目标或值不同，则认为是变更。
         """
         changed_keys = []
+        seen_keys = set(exclude_keys)
 
         cursor = 0
         scanned_count = 0
 
         logger.debug(f"开始值比较检测，排除键数: {len(exclude_keys)}")
 
-        while len(changed_keys) < max_changes and scanned_count < 50000:
+        while len(changed_keys) < max_changes:
             try:
-                cursor, keys = self.source_client.scan(
-                    cursor=cursor,
-                    match=key_pattern,
-                    count=self.scan_count // 2  # 比较模式使用较小的count
+                cursor, keys = self._scan_page(
+                    cursor,
+                    key_pattern,
+                    max(1, self.scan_count // 2),
                 )
 
-                for key in keys:
+                candidates = list(keys)
+                if key_filter and candidates:
+                    candidates = list(
+                        key_filter.filter_batch(self.source_client, candidates)
+                    )
+
+                for key in candidates:
                     scanned_count += 1
-                    key_str = key.decode() if isinstance(key, bytes) else key
 
-                    # 跳过已经检测过的键
-                    if key_str in exclude_keys:
+                    # SCAN can return the same key on multiple pages while the
+                    # hash table is being rehashed. Count each key once per pass
+                    # so duplicates cannot consume the bounded change budget.
+                    if key in seen_keys:
                         continue
+                    seen_keys.add(key)
 
-                    try:
-                        # 检查键类型
-                        if key_types:
-                            key_type = self.source_client.type(key)
-                            if isinstance(key_type, bytes):
-                                key_type = key_type.decode()
-                            if key_type not in key_types:
-                                continue
+                    # 检查键类型
+                    if key_types:
+                        key_type = self.source_client.type(key)
+                        if isinstance(key_type, bytes):
+                            key_type = key_type.decode()
+                        if key_type not in key_types:
+                            continue
 
-                        # 比较源和目标的值
-                        is_different, reason = self._is_key_different(key)
-                        if is_different:
-                            changed_keys.append(key_str)
-                            logger.debug(f"检测到变更键: {key_str}, 原因: {reason}")
+                    # 比较源和目标的值与过期状态
+                    is_different, reason = self._is_key_different(key)
+                    if is_different:
+                        changed_keys.append(key)
+                        logger.debug("检测到变更键: %r, 原因: %s", key, reason)
 
-                            if len(changed_keys) >= max_changes:
-                                break
-
-                    except Exception as e:
-                        logger.debug(f"比较键 {key} 失败: {e}")
-                        continue
+                        if len(changed_keys) >= max_changes:
+                            break
 
                 if cursor == 0:
                     break
 
             except Exception as e:
                 logger.error(f"比较扫描时出错: {e}")
-                break
+                raise MigrationError(f"值比较 SCAN 失败: {e}") from e
 
         logger.info(f"通过值比较检测到 {len(changed_keys)} 个变更的键（扫描了{scanned_count}个键）")
         return changed_keys
+
+    def _detect_target_only_keys(
+        self,
+        key_pattern: str,
+        key_types: Optional[List[str]],
+        max_changes: int,
+        exclude_keys: Set[Key],
+        key_filter: Optional[KeySyncFilter] = None,
+    ) -> List[Key]:
+        """Find target keys that disappeared from the managed source keyspace."""
+        if max_changes <= 0:
+            return []
+        deleted = []
+        seen_keys = set(exclude_keys)
+        cursor = 0
+        while len(deleted) < max_changes:
+            cursor, raw_keys = self._scan_target_page(
+                cursor, key_pattern, max(1, self.scan_count)
+            )
+            keys = []
+            for key in raw_keys:
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                keys.append(key)
+            if key_filter:
+                keys = list(key_filter.filter_batch(self.target_client, list(keys)))
+            if key_types and keys:
+                typed_keys = []
+                for chunk in _key_chunks(keys):
+                    pipe = self.target_client.pipeline(transaction=False)
+                    for key in chunk:
+                        pipe.type(key)
+                    raw_types = pipe.execute(raise_on_error=False)
+                    for value in raw_types:
+                        if isinstance(value, BaseException):
+                            raise value
+                    typed_keys.extend(
+                        key
+                        for key, key_type in zip(chunk, raw_types)
+                        if (
+                            key_type.decode()
+                            if isinstance(key_type, bytes)
+                            else str(key_type)
+                        ) in key_types
+                    )
+                keys = typed_keys
+            if keys:
+                stride = 2 if key_types else 1
+                source_allowed = []
+                for chunk in _key_chunks(keys):
+                    pipe = self.source_client.pipeline(transaction=False)
+                    for key in chunk:
+                        pipe.exists(key)
+                        if key_types:
+                            pipe.type(key)
+                    raw_source = pipe.execute(raise_on_error=False)
+                    for index, key in enumerate(chunk):
+                        source_exists = raw_source[index * stride]
+                        source_type = (
+                            raw_source[index * stride + 1] if key_types else None
+                        )
+                        if isinstance(source_exists, BaseException):
+                            raise source_exists
+                        if isinstance(source_type, BaseException):
+                            raise source_type
+                        allowed = bool(source_exists)
+                        if allowed and key_types:
+                            normalized = (
+                                source_type.decode()
+                                if isinstance(source_type, bytes)
+                                else str(source_type)
+                            )
+                            allowed = normalized in key_types
+                        if allowed:
+                            source_allowed.append(key)
+
+                if key_filter and source_allowed:
+                    source_allowed = list(
+                        key_filter.filter_batch(self.source_client, source_allowed)
+                    )
+                allowed_set = set(source_allowed)
+                for key in keys:
+                    if key not in allowed_set:
+                        deleted.append(key)
+                        if len(deleted) >= max_changes:
+                            break
+            if cursor == 0:
+                break
+        return deleted
     
     def _is_key_different(self, key) -> tuple:
         """
@@ -462,76 +657,210 @@ class IncrementalMigrationHandler:
         返回:
             (is_different, reason): 是否不同和原因
         """
-        try:
-            # 检查键是否存在于目标
-            if not self.target_client.exists(key):
-                return (True, "目标中不存在")
+        if not self.target_client.exists(key):
+            return (True, "目标中不存在")
 
-            # 检查类型是否相同
-            source_type = self.source_client.type(key)
-            target_type = self.target_client.type(key)
+        if not redis_values_equal(self.source_client, self.target_client, key):
+            return (True, "序列化值不同")
 
-            if isinstance(source_type, bytes):
-                source_type = source_type.decode()
-            if isinstance(target_type, bytes):
-                target_type = target_type.decode()
+        source_ttl = int(self.source_client.pttl(key))
+        target_ttl = int(self.target_client.pttl(key))
+        if source_ttl <= 0 or target_ttl <= 0:
+            if source_ttl != target_ttl:
+                return (True, f"过期状态不同: {source_ttl} vs {target_ttl}")
+        elif abs(source_ttl - target_ttl) > 2000:
+            return (True, f"TTL不同: {source_ttl} vs {target_ttl}")
+        return (False, "值和TTL相同")
 
-            if source_type != target_type:
-                return (True, f"类型不同: {source_type} vs {target_type}")
+    def _source_key_in_scope(
+        self,
+        key: Key,
+        key_types: Optional[List[str]],
+        key_filter: Optional[KeySyncFilter],
+    ) -> bool:
+        """Re-evaluate dynamic source filters immediately before a delete."""
+        if not self.source_client.exists(key):
+            return False
+        if key_types:
+            key_type = self.source_client.type(key)
+            normalized = (
+                key_type.decode() if isinstance(key_type, bytes) else str(key_type)
+            )
+            if normalized not in key_types:
+                return False
+        if key_filter:
+            return bool(key_filter.filter_batch(self.source_client, [key]))
+        return True
 
-            # 根据类型比较值
-            if source_type == 'string':
-                source_val = self.source_client.get(key)
-                target_val = self.target_client.get(key)
-                if source_val != target_val:
-                    return (True, "值不同")
+    def _capture_scoped_source_key(
+        self,
+        key: Key,
+        key_types: Optional[List[str]],
+        key_filter: Optional[KeySyncFilter],
+    ):
+        """Atomically capture one source value and its dynamic filter state."""
+        if key_filter and not key_filter.name_allowed(key):
+            return False, None, None
 
-            elif source_type == 'hash':
-                source_hash = self.source_client.hgetall(key)
-                target_hash = self.target_client.hgetall(key)
-                if source_hash != target_hash:
-                    return (True, "哈希值不同")
+        has_pexpiretime = source_supports_pexpiretime(self.source_client, key)
+        need_type = bool(key_types)
+        need_memory = bool(key_filter and key_filter.max_key_size > 0)
+        pipe = self.source_client.pipeline(transaction=True)
+        pipe.dump(key)
+        pipe.pttl(key)
+        if has_pexpiretime:
+            pipe.execute_command("PEXPIRETIME", key)
+        if need_type:
+            pipe.type(key)
+        if need_memory:
+            pipe.execute_command("MEMORY", "USAGE", key)
 
-            elif source_type == 'list':
-                source_list = self.source_client.lrange(key, 0, -1)
-                target_list = self.target_client.lrange(key, 0, -1)
-                if source_list != target_list:
-                    return (True, "列表值不同")
+        sample_started_ns = time.monotonic_ns()
+        raw = pipe.execute(raise_on_error=False)
+        expected = 2 + int(has_pexpiretime) + int(need_type) + int(need_memory)
+        if len(raw) != expected:
+            raise RuntimeError(
+                f"源端过滤采样返回数量不匹配: {len(raw)} != {expected}"
+            )
+        for response_index, value in enumerate(raw):
+            # Capability is cached per client, so a Redis failover or live ACL
+            # change can invalidate a previously successful PEXPIRETIME probe.
+            # PTTL from this same EXEC still gives us a conservative deadline.
+            if (
+                isinstance(value, BaseException)
+                and not (has_pexpiretime and response_index == 2)
+            ):
+                raise value
 
-            elif source_type == 'set':
-                source_set = self.source_client.smembers(key)
-                target_set = self.target_client.smembers(key)
-                if source_set != target_set:
-                    return (True, "集合值不同")
+        index = 0
+        dump_data = raw[index]
+        index += 1
+        ttl_ms = int(raw[index])
+        index += 1
+        expiry_value = raw[index] if has_pexpiretime else None
+        index += int(has_pexpiretime)
+        key_type = raw[index] if need_type else None
+        index += int(need_type)
+        memory_size = raw[index] if need_memory else None
 
-            elif source_type == 'zset':
-                source_zset = self.source_client.zrange(key, 0, -1, withscores=True)
-                target_zset = self.target_client.zrange(key, 0, -1, withscores=True)
-                if source_zset != target_zset:
-                    return (True, "有序集合值不同")
+        if dump_data is None or ttl_ms in (-2, 0):
+            return False, None, None
+        if ttl_ms < -2:
+            raise ValueError(f"无效的 PTTL 响应: {ttl_ms}")
 
+        expires_at_ms = None
+        remaining_ttl_ms = None
+        if ttl_ms > 0:
+            observed_at_ms = int(time.time() * 1000)
+            try:
+                absolute_ms = int(expiry_value)
+            except (TypeError, ValueError):
+                absolute_ms = -1
+            if absolute_ms > 0:
+                expires_at_ms = absolute_ms
+                remaining_ttl_ms = absolute_ms - observed_at_ms
             else:
-                # 对于其他类型，假设不同
-                return (True, f"未知类型: {source_type}")
+                elapsed_ms = (
+                    max(0, time.monotonic_ns() - sample_started_ns) + 999_999
+                ) // 1_000_000
+                remaining_ttl_ms = ttl_ms - elapsed_ms
+                expires_at_ms = observed_at_ms + remaining_ttl_ms
+            if remaining_ttl_ms <= 0:
+                return False, None, None
 
-            # 值相同
-            return (False, "值相同")
+        if need_type:
+            normalized_type = (
+                key_type.decode("ascii", errors="replace").lower()
+                if isinstance(key_type, bytes)
+                else str(key_type).lower()
+            )
+            allowed_types = {
+                item.decode("ascii", errors="replace").lower()
+                if isinstance(item, bytes)
+                else str(item).lower()
+                for item in key_types or ()
+            }
+            if normalized_type not in allowed_types:
+                return False, None, None
 
-        except Exception as e:
-            logger.debug(f"比较键 {key} 时出错: {e}")
-            return (True, f"比较出错: {str(e)}")  # 出错时假设不同，需要同步
-    
-    def _sync_changed_keys(self, changed_keys: List[str]) -> Dict[str, int]:
+        if (
+            key_filter
+            and key_filter.min_ttl > 0
+            and remaining_ttl_ms is not None
+            and remaining_ttl_ms < key_filter.min_ttl * 1000
+        ):
+            return False, None, None
+        if (
+            need_memory
+            and memory_size is not None
+            and int(memory_size) > key_filter.max_key_size
+        ):
+            return False, None, None
+        return True, dump_data, expires_at_ms
+
+    def _sync_deletion_candidate(
+        self,
+        key: Key,
+        key_types: Optional[List[str]],
+        key_filter: Optional[KeySyncFilter],
+        _repair_depth: int = 0,
+    ) -> bool:
+        """Delete an out-of-scope key, repairing a concurrent re-entry."""
+        if key_filter and not key_filter.name_allowed(key):
+            return True
+        if self._source_key_in_scope(key, key_types, key_filter):
+            if _repair_depth >= 1:
+                return False
+            return self._sync_single_key(
+                key, key_types, key_filter, _repair_depth=_repair_depth + 1
+            )
+
+        delete_command = build_atomic_filtered_delete_command(
+            [key],
+            key_types=key_types,
+            min_ttl=key_filter.min_ttl if key_filter else 0,
+            max_key_size=key_filter.max_key_size if key_filter else 0,
+        )
+        deleted = self.target_client.execute_command(*delete_command)
+
+        # A source key can be recreated or move back into a dynamic TTL/size
+        # filter while the target DEL is in flight. Recheck and restore it now.
+        if self._source_key_in_scope(key, key_types, key_filter):
+            if _repair_depth >= 1:
+                return False
+            return self._sync_single_key(
+                key, key_types, key_filter, _repair_depth=_repair_depth + 1
+            )
+
+        if deleted:
+            with self._stats_lock:
+                self.incremental_stats["change_types"]["deleted"] += int(deleted)
+        return True
+
+    def _sync_changed_keys(
+        self,
+        changed_keys: List[Key],
+        deletion_candidates: Optional[Set[Key]] = None,
+        key_types: Optional[List[str]] = None,
+        key_filter: Optional[KeySyncFilter] = None,
+    ) -> Dict[str, int]:
         """同步变更的键。"""
         synced_count = 0
         failed_count = 0
+        deletion_candidates = set(deletion_candidates or ())
 
         logger.info(f"开始同步 {len(changed_keys)} 个变更的键")
 
         for i, key in enumerate(changed_keys, 1):
             try:
                 logger.debug(f"  [{i}/{len(changed_keys)}] 同步键: {key}")
-                if self._sync_single_key(key):
+                if key in deletion_candidates:
+                    success = self._sync_deletion_candidate(
+                        key, key_types, key_filter
+                    )
+                else:
+                    success = self._sync_single_key(key, key_types, key_filter)
+                if success:
                     synced_count += 1
                     logger.debug(f"    ✓ 同步成功")
                 else:
@@ -544,10 +873,72 @@ class IncrementalMigrationHandler:
         logger.info(f"同步完成: 成功 {synced_count}, 失败 {failed_count}")
         return {'synced': synced_count, 'failed': failed_count}
     
-    def _sync_single_key(self, key: str) -> bool:
+    def _sync_single_key(
+        self,
+        key: Key,
+        key_types: Optional[List[str]] = None,
+        key_filter: Optional[KeySyncFilter] = None,
+        *,
+        _repair_depth: int = 0,
+    ) -> bool:
         """使用 DUMP/RESTORE 原子同步单个键（含流等类型）。"""
         try:
-            src_exists = bool(self.source_client.exists(key))
+            if key_types or key_filter:
+                in_scope, dump_data, expires_at_ms = (
+                    self._capture_scoped_source_key(key, key_types, key_filter)
+                )
+                if not in_scope:
+                    return self._sync_deletion_candidate(
+                        key,
+                        key_types,
+                        key_filter,
+                        _repair_depth=_repair_depth,
+                    )
+                try:
+                    restored = restore_dump_with_deadline(
+                        self.target_client,
+                        key,
+                        dump_data,
+                        expires_at_ms,
+                        overwrite=True,
+                    )
+                except redis.ResponseError as error:
+                    if not _is_restore_compatibility_error(error):
+                        raise
+                    fallback_pttl = (
+                        -1
+                        if expires_at_ms is None
+                        else max(
+                            1,
+                            expires_at_ms - int(time.time() * 1000),
+                        )
+                    )
+                    restored = _sync_key_fallback(
+                        self.source_client,
+                        self.target_client,
+                        key,
+                        fallback_pttl,
+                        True,
+                        overwrite=True,
+                        expires_at_ms=expires_at_ms,
+                        expected_dump=dump_data,
+                        key_types=key_types,
+                        min_ttl=key_filter.min_ttl if key_filter else 0,
+                        max_key_size=key_filter.max_key_size if key_filter else 0,
+                    )
+                if not restored:
+                    return False
+                if not self._source_key_in_scope(key, key_types, key_filter):
+                    return self._sync_deletion_candidate(
+                        key,
+                        key_types,
+                        key_filter,
+                        _repair_depth=_repair_depth,
+                    )
+                with self._stats_lock:
+                    self.incremental_stats["change_types"]["updated"] += 1
+                return True
+
             sync_key_with_dump_restore(
                 self.source_client,
                 self.target_client,
@@ -555,7 +946,7 @@ class IncrementalMigrationHandler:
                 overwrite=True,
             )
             with self._stats_lock:
-                if not src_exists:
+                if not self.source_client.exists(key):
                     self.incremental_stats["change_types"]["deleted"] += 1
                 else:
                     self.incremental_stats["change_types"]["updated"] += 1
@@ -564,6 +955,48 @@ class IncrementalMigrationHandler:
         except Exception as e:
             logger.error("      ✗ 同步键 %s 失败: %s", key, e, exc_info=True)
             return False
+
+    def _scan_page(self, cursor: int, pattern: str, count: int):
+        """读取一页 SCAN；持续失败时向上层返回明确错误。"""
+        last_error = None
+        for attempt in range(1, self.SCAN_MAX_RETRIES + 1):
+            try:
+                return self.source_client.scan(
+                    cursor=cursor,
+                    match=pattern,
+                    count=count,
+                )
+            except Exception as e:
+                last_error = e
+                if attempt < self.SCAN_MAX_RETRIES:
+                    logger.warning(
+                        "增量 SCAN 失败，准备重试 (%s/%s): %s",
+                        attempt,
+                        self.SCAN_MAX_RETRIES,
+                        e,
+                    )
+                    if self.SCAN_RETRY_DELAY > 0:
+                        time.sleep(self.SCAN_RETRY_DELAY * attempt)
+        raise MigrationError(
+            f"增量 SCAN 连续失败 {self.SCAN_MAX_RETRIES} 次: {last_error}"
+        ) from last_error
+
+    def _scan_target_page(self, cursor: int, pattern: str, count: int):
+        last_error = None
+        for attempt in range(1, self.SCAN_MAX_RETRIES + 1):
+            try:
+                return self.target_client.scan(
+                    cursor=cursor,
+                    match=pattern,
+                    count=count,
+                )
+            except Exception as e:
+                last_error = e
+                if attempt < self.SCAN_MAX_RETRIES and self.SCAN_RETRY_DELAY > 0:
+                    time.sleep(self.SCAN_RETRY_DELAY * attempt)
+        raise MigrationError(
+            f"目标 SCAN 连续失败 {self.SCAN_MAX_RETRIES} 次: {last_error}"
+        ) from last_error
 
     def get_incremental_stats(self) -> Dict[str, Any]:
         """获取增量迁移统计信息。"""

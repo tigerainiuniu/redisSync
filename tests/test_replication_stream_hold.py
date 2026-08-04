@@ -3,12 +3,24 @@ hold_connection_for_stream + start_replication_stream 集成测试（伪造连�
 防止重构后「宣称启用持续复制但实际未挂接连接」的回归。
 """
 
+import inspect
 import threading
 import time
-
-import redis
+import socket
 
 from redis_sync.sync_handler import SyncHandler
+
+
+def test_sync_handler_snapshot_entrypoints_preserve_target_by_default():
+    assert inspect.signature(SyncHandler.perform_full_sync).parameters[
+        "clear_target"
+    ].default is False
+    assert inspect.signature(SyncHandler.perform_psync).parameters[
+        "clear_target"
+    ].default is False
+    assert inspect.signature(SyncHandler._apply_rdb_data).parameters[
+        "clear_target"
+    ].default is False
 
 
 class SyncHandlerNoMigrate(SyncHandler):
@@ -29,26 +41,51 @@ class FakePool:
         pass
 
 
+def resp_command(*parts):
+    value = f"*{len(parts)}\r\n".encode()
+    for part in parts:
+        value += f"${len(part)}\r\n".encode() + part + b"\r\n"
+    return value
+
+
+class FakeSocket:
+    def __init__(self, wire):
+        self.wire = bytearray(wire)
+
+    def recv(self, size):
+        if not self.wire:
+            raise socket.timeout()
+        data = bytes(self.wire[:size])
+        del self.wire[:size]
+        return data
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
+
 class FakeConnectionForSyncStream:
-    """SYNC: 首包 RDB bytes；读流: 一条 SET，之后 Timeout 直到 stop_event。"""
+    """Serve a coalesced RDB and SET frame from one raw socket buffer."""
 
-    def __init__(self):
-        self.n = 0
+    def __init__(self, psync_header=False):
+        rdb = b"REDIS0012fake_rdb_payload"
+        header = b"+FULLRESYNC replid 41\r\n" if psync_header else b""
+        self._sock = FakeSocket(
+            header + b"$" + str(len(rdb)).encode() + b"\r\n" + rdb
+            + resp_command(b"SET", b"stream_key", b"\xffbinary-value")
+        )
+        self.sent = []
+        self.disconnected = False
 
-    def send_command(self, *args):
-        pass
+    def send_command(self, *args, **kwargs):
+        assert kwargs.get("check_health") is False
+        self.sent.append(args)
 
-    def read_response(self):
-        self.n += 1
-        if self.n == 1:
-            return b"REDIS0012fake_rdb_payload"
-        if self.n == 2:
-            return [b"SET", b"stream_key", b"\xffbinary-value"]
-        raise redis.TimeoutError()
+    def disconnect(self):
+        self.disconnected = True
 
 
 def test_full_sync_hold_then_stream_delivers_command_bytes():
-    fc = FakeConnectionForSyncStream()
+    fc = FakeConnectionForSyncStream(psync_header=True)
     source = type("SC", (), {})()
     source.connection_pool = FakePool(fc)
     source.info = lambda section=None: {"role": "master"}
@@ -64,6 +101,8 @@ def test_full_sync_hold_then_stream_delivers_command_bytes():
     )
 
     assert handler._replication_stream_connection is fc, "成功 SYNC 后应暂存连接供读流"
+    assert ("PSYNC", "?", -1) in fc.sent
+    assert not any(command[0] == "SYNC" for command in fc.sent)
 
     received = []
 
@@ -92,18 +131,18 @@ def test_full_sync_hold_then_stream_delivers_command_bytes():
 
 class FakeConnectionForPsyncContinue:
     def __init__(self):
-        self.n = 0
+        self._sock = FakeSocket(
+            b"+CONTINUE\r\n" + resp_command(b"PING")
+        )
+        self.sent = []
+        self.disconnected = False
 
-    def send_command(self, *args):
-        pass
+    def send_command(self, *args, **kwargs):
+        assert kwargs.get("check_health") is False
+        self.sent.append(args)
 
-    def read_response(self):
-        self.n += 1
-        if self.n == 1:
-            return b"+CONTINUE\r\n"
-        if self.n == 2:
-            return [b"PING"]
-        raise redis.TimeoutError()
+    def disconnect(self):
+        self.disconnected = True
 
 
 def test_psync_continue_hold_then_stream():

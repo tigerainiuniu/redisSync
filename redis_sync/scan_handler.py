@@ -8,7 +8,7 @@ Redis SCAN命令处理器
 import redis
 import logging
 import time
-from typing import Optional, Callable, List, Dict, Any, Iterator, TYPE_CHECKING
+from typing import Optional, Callable, List, Dict, Any, Iterator, TYPE_CHECKING, Union
 
 if TYPE_CHECKING:
     from .sync_filters import KeySyncFilter
@@ -18,9 +18,17 @@ try:
 except ImportError:
     tqdm = None
 
-from .key_sync import sync_key_with_dump_restore
+from .key_sync import redis_values_equal, sync_key_with_dump_restore
+from .exceptions import MigrationError
 
 logger = logging.getLogger(__name__)
+Key = Union[str, bytes]
+MAX_PIPELINE_KEYS = 200
+
+
+def _key_chunks(keys, batch_size: int = MAX_PIPELINE_KEYS):
+    for offset in range(0, len(keys), batch_size):
+        yield keys[offset:offset + batch_size]
 
 
 def _type_str(val):
@@ -29,6 +37,9 @@ def _type_str(val):
 
 class ScanHandler:
     """处理Redis SCAN命令进行增量键迁移。"""
+
+    SCAN_MAX_RETRIES = 3
+    SCAN_RETRY_DELAY = 0.1
     
     def __init__(self, source_client: redis.Redis, target_client: redis.Redis):
         """
@@ -44,7 +55,7 @@ class ScanHandler:
     def scan_keys(self,
                   pattern: str = "*",
                   count: int = 1000,
-                  key_type: Optional[str] = None) -> Iterator[List[str]]:
+                  key_type: Optional[str] = None) -> Iterator[List[Key]]:
         """
         使用SCAN命令从源Redis扫描键。
 
@@ -58,37 +69,53 @@ class ScanHandler:
         """
         cursor = 0
         while True:
+            cursor, keys = self._scan_page(cursor, pattern, count)
+
+            # Filter by type if specified
+            if key_type and keys:
+                filtered_keys = []
+                for key in keys:
+                    try:
+                        if _type_str(self.source_client.type(key)) == key_type:
+                            filtered_keys.append(key)
+                    except Exception as e:
+                        raise MigrationError(
+                            f"Error checking type for key {key!r}: {e}"
+                        ) from e
+                keys = filtered_keys
+
+            if keys:
+                yield list(keys)
+
+            if cursor == 0:
+                break
+
+    def _scan_page(self, cursor: int, pattern: str, count: int):
+        last_error = None
+        for attempt in range(1, self.SCAN_MAX_RETRIES + 1):
             try:
-                # Perform SCAN
-                cursor, keys = self.source_client.scan(
+                return self.source_client.scan(
                     cursor=cursor,
                     match=pattern,
-                    count=count
+                    count=count,
                 )
-                
-                # Filter by type if specified
-                if key_type and keys:
-                    filtered_keys = []
-                    for key in keys:
-                        try:
-                            if _type_str(self.source_client.type(key)) == key_type:
-                                filtered_keys.append(key)
-                        except Exception as e:
-                            logger.warning(f"Error checking type for key {key}: {e}")
-                    keys = filtered_keys
-                
-                if keys:
-                    yield [key.decode() if isinstance(key, bytes) else key for key in keys]
-                
-                if cursor == 0:
-                    break
-                    
             except Exception as e:
-                logger.error(f"Error during SCAN operation: {e}")
-                break
+                last_error = e
+                if attempt < self.SCAN_MAX_RETRIES:
+                    logger.warning(
+                        "SCAN failed, retrying (%s/%s): %s",
+                        attempt,
+                        self.SCAN_MAX_RETRIES,
+                        e,
+                    )
+                    if self.SCAN_RETRY_DELAY > 0:
+                        time.sleep(self.SCAN_RETRY_DELAY * attempt)
+        raise MigrationError(
+            f"SCAN failed {self.SCAN_MAX_RETRIES} times: {last_error}"
+        ) from last_error
     
     def migrate_keys(self, 
-                    keys: List[str],
+                    keys: List[Key],
                     batch_size: int = 100,
                     preserve_ttl: bool = True,
                     overwrite: bool = False,
@@ -133,7 +160,8 @@ class ScanHandler:
         
         logger.info(f"Migration completed. Migrated: {stats['migrated_keys']}, "
                    f"Failed: {stats['failed_keys']}, Skipped: {stats['skipped_keys']}")
-        
+
+        stats['success'] = stats['failed_keys'] == 0
         return stats
     
     def migrate_all_keys(self,
@@ -170,16 +198,10 @@ class ScanHandler:
         
         logger.info(f"Starting full migration with pattern: {pattern}")
         
-        def _apply_filter(batch: List[str]) -> List[str]:
+        def _apply_filter(batch: List[Key]) -> List[Key]:
             if not key_filter or not batch:
                 return batch
-            filtered = key_filter.filter_batch(self.source_client, list(batch))
-            return [
-                k.decode("utf-8", errors="surrogateescape")
-                if isinstance(k, bytes)
-                else str(k)
-                for k in filtered
-            ]
+            return list(key_filter.filter_batch(self.source_client, list(batch)))
 
         # First pass: count total keys for progress tracking
         total_keys = 0
@@ -218,11 +240,12 @@ class ScanHandler:
         
         logger.info(f"Full migration completed. Migrated: {stats['migrated_keys']}, "
                    f"Failed: {stats['failed_keys']}, Skipped: {stats['skipped_keys']}")
-        
+
+        stats['success'] = stats['failed_keys'] == 0
         return stats
     
     def _migrate_batch(self, 
-                      keys: List[str],
+                      keys: List[Key],
                       preserve_ttl: bool = True,
                       overwrite: bool = False) -> Dict[str, Any]:
         """
@@ -260,7 +283,7 @@ class ScanHandler:
         return stats
     
     def _migrate_single_key(self, 
-                           key: str,
+                           key: Key,
                            preserve_ttl: bool = True,
                            overwrite: bool = False) -> bool:
         """
@@ -283,15 +306,16 @@ class ScanHandler:
                 logger.warning("Key '%s' doesn't exist in source", key)
                 return False
 
-            sync_key_with_dump_restore(
+            migrated = sync_key_with_dump_restore(
                 self.source_client,
                 self.target_client,
                 key,
-                overwrite=True,
+                overwrite=overwrite,
                 preserve_ttl=preserve_ttl,
             )
-            logger.debug("Successfully migrated key '%s'", key)
-            return True
+            if migrated:
+                logger.debug("Successfully migrated key '%s'", key)
+            return migrated
 
         except Exception as e:
             logger.error("Error migrating key '%s': %s", key, e)
@@ -300,7 +324,9 @@ class ScanHandler:
     def compare_keys(self,
                     pattern: str = "*",
                     sample_size: Optional[int] = None,
-                    use_fast_mode: bool = True) -> Dict[str, Any]:
+                    use_fast_mode: bool = True,
+                    key_types: Optional[List[str]] = None,
+                    key_filter: Optional["KeySyncFilter"] = None) -> Dict[str, Any]:
         """
         Compare keys between source and target Redis instances.
 
@@ -315,11 +341,51 @@ class ScanHandler:
         logger.info(f"Comparing keys with pattern: {pattern}, fast_mode: {use_fast_mode}")
 
         if use_fast_mode:
-            return self._compare_keys_fast(pattern, sample_size)
+            return self._compare_keys_fast(
+                pattern, sample_size, key_types=key_types, key_filter=key_filter
+            )
         else:
-            return self._compare_keys_full(pattern, sample_size)
+            return self._compare_keys_full(
+                pattern, sample_size, key_types=key_types, key_filter=key_filter
+            )
 
-    def _compare_keys_fast(self, pattern: str, sample_size: Optional[int]) -> Dict[str, Any]:
+    def _verification_batches(
+        self,
+        pattern: str,
+        key_types: Optional[List[str]],
+        key_filter: Optional["KeySyncFilter"],
+    ):
+        allowed_types = set(key_types or [])
+        for raw_batch in self.scan_keys(pattern):
+            batch = list(raw_batch)
+            if allowed_types and batch:
+                typed_keys = []
+                for chunk in _key_chunks(batch):
+                    pipe = self.source_client.pipeline(transaction=False)
+                    for key in chunk:
+                        pipe.type(key)
+                    raw_types = pipe.execute()
+                    for value in raw_types:
+                        if isinstance(value, BaseException):
+                            raise value
+                    typed_keys.extend(
+                        key
+                        for key, key_type in zip(chunk, raw_types)
+                        if _type_str(key_type) in allowed_types
+                    )
+                batch = typed_keys
+            if key_filter and batch:
+                batch = list(key_filter.filter_batch(self.source_client, batch))
+            if batch:
+                yield batch
+
+    def _compare_keys_fast(
+        self,
+        pattern: str,
+        sample_size: Optional[int],
+        key_types: Optional[List[str]] = None,
+        key_filter: Optional["KeySyncFilter"] = None,
+    ) -> Dict[str, Any]:
         """快速验证模式：只检查键是否存在和类型是否匹配（使用Pipeline批量处理）"""
         results = {
             'total_compared': 0,
@@ -330,67 +396,93 @@ class ScanHandler:
         }
 
         compared_count = 0
-        batch_size = 500  # 每批处理500个键
+        batch_size = MAX_PIPELINE_KEYS
 
-        for key_batch in self.scan_keys(pattern):
+        for key_batch in self._verification_batches(pattern, key_types, key_filter):
             if sample_size and compared_count >= sample_size:
                 break
 
-            # 限制批次大小
-            keys_to_check = key_batch[:min(len(key_batch), batch_size)]
-            if sample_size:
-                remaining = sample_size - compared_count
-                keys_to_check = keys_to_check[:remaining]
+            for offset in range(0, len(key_batch), batch_size):
+                keys_to_check = key_batch[offset:offset + batch_size]
+                if sample_size:
+                    remaining = sample_size - compared_count
+                    keys_to_check = keys_to_check[:remaining]
+                if not keys_to_check:
+                    break
+                try:
+                    # 使用Pipeline批量检查目标Redis
+                    target_pipe = self.target_client.pipeline(transaction=False)
+                    for key in keys_to_check:
+                        target_pipe.exists(key)
+                        target_pipe.type(key)
 
-            try:
-                # 使用Pipeline批量检查目标Redis
-                target_pipe = self.target_client.pipeline(transaction=False)
-                for key in keys_to_check:
-                    target_pipe.exists(key)
-                    target_pipe.type(key)
-
-                target_results = target_pipe.execute()
+                    target_results = target_pipe.execute()
 
                 # 使用Pipeline批量检查源Redis（只获取类型）
-                source_pipe = self.source_client.pipeline(transaction=False)
-                for key in keys_to_check:
-                    source_pipe.type(key)
+                    source_pipe = self.source_client.pipeline(transaction=False)
+                    for key in keys_to_check:
+                        source_pipe.type(key)
 
-                source_types = source_pipe.execute()
+                    source_types = source_pipe.execute()
 
                 # 解析结果
-                for i, key in enumerate(keys_to_check):
-                    exists_in_target = target_results[i * 2]
-                    target_type = target_results[i * 2 + 1]
-                    source_type = source_types[i]
-                    if isinstance(exists_in_target, Exception):
-                        exists_in_target = False
-                    if isinstance(source_type, Exception):
-                        source_type = b"none"
-                    if isinstance(target_type, Exception):
-                        target_type = b"none"
-                    st = _type_str(source_type)
-                    tt = _type_str(target_type)
+                    for i, key in enumerate(keys_to_check):
+                        exists_in_target = target_results[i * 2]
+                        target_type = target_results[i * 2 + 1]
+                        source_type = source_types[i]
 
-                    results['total_compared'] += 1
-                    compared_count += 1
+                        results['total_compared'] += 1
+                        compared_count += 1
 
-                    if not exists_in_target:
-                        results['missing_in_target'] += 1
-                    elif st != tt:
-                        results['type_mismatches'] += 1
-                    else:
-                        results['matching_keys'] += 1
+                        command_errors = [
+                            (command, value)
+                            for command, value in (
+                                ('target EXISTS', exists_in_target),
+                                ('target TYPE', target_type),
+                                ('source TYPE', source_type),
+                            )
+                            if isinstance(value, BaseException)
+                        ]
+                        if command_errors:
+                            details = '; '.join(
+                                f"{command}: {error}"
+                                for command, error in command_errors
+                            )
+                            results['errors'].append(
+                                f"Error comparing key {key!r}: {details}"
+                            )
+                            continue
 
-            except Exception as e:
-                error_msg = f"Error comparing batch: {e}"
-                results['errors'].append(error_msg)
-                logger.error(error_msg)
+                        st = _type_str(source_type)
+                        tt = _type_str(target_type)
+
+                        if not exists_in_target:
+                            results['missing_in_target'] += 1
+                        elif st != tt:
+                            results['type_mismatches'] += 1
+                        else:
+                            results['matching_keys'] += 1
+
+                except Exception as e:
+                    error_msg = f"Error comparing batch: {e}"
+                    results['errors'].append(error_msg)
+                    results['total_compared'] += len(keys_to_check)
+                    compared_count += len(keys_to_check)
+                    logger.error(error_msg)
+
+                if sample_size and compared_count >= sample_size:
+                    break
 
         logger.info(f"Fast comparison completed. Compared {results['total_compared']} keys")
         return results
 
-    def _compare_keys_full(self, pattern: str, sample_size: Optional[int]) -> Dict[str, Any]:
+    def _compare_keys_full(
+        self,
+        pattern: str,
+        sample_size: Optional[int],
+        key_types: Optional[List[str]] = None,
+        key_filter: Optional["KeySyncFilter"] = None,
+    ) -> Dict[str, Any]:
         """完整验证模式：检查键存在、类型、值（逐个处理，慢）"""
         results = {
             'total_compared': 0,
@@ -403,7 +495,7 @@ class ScanHandler:
         }
 
         compared_count = 0
-        for key_batch in self.scan_keys(pattern):
+        for key_batch in self._verification_batches(pattern, key_types, key_filter):
             for key in key_batch:
                 if sample_size and compared_count >= sample_size:
                     break
@@ -413,7 +505,11 @@ class ScanHandler:
                     results['total_compared'] += 1
 
                     if comparison['exists_in_target']:
-                        if comparison['values_match'] and comparison['types_match']:
+                        if (
+                            comparison['values_match']
+                            and comparison['types_match']
+                            and comparison['ttl_match']
+                        ):
                             results['matching_keys'] += 1
                         else:
                             if not comparison['values_match']:
@@ -431,6 +527,8 @@ class ScanHandler:
                 except Exception as e:
                     error_msg = f"Error comparing key '{key}': {e}"
                     results['errors'].append(error_msg)
+                    results['total_compared'] += 1
+                    compared_count += 1
                     logger.error(error_msg)
 
             if sample_size and compared_count >= sample_size:
@@ -462,21 +560,12 @@ class ScanHandler:
         if not result['types_match']:
             return result
         
-        # Compare values based on type
-        if source_type == 'string':
-            result['values_match'] = self.source_client.get(key) == self.target_client.get(key)
-        elif source_type == 'list':
-            result['values_match'] = (self.source_client.lrange(key, 0, -1) == 
-                                    self.target_client.lrange(key, 0, -1))
-        elif source_type == 'set':
-            result['values_match'] = (self.source_client.smembers(key) == 
-                                    self.target_client.smembers(key))
-        elif source_type == 'zset':
-            result['values_match'] = (self.source_client.zrange(key, 0, -1, withscores=True) == 
-                                    self.target_client.zrange(key, 0, -1, withscores=True))
-        elif source_type == 'hash':
-            result['values_match'] = (self.source_client.hgetall(key) == 
-                                    self.target_client.hgetall(key))
+        result['values_match'] = redis_values_equal(
+            self.source_client,
+            self.target_client,
+            key,
+            key_type=source_type,
+        )
         
         # Compare TTL
         source_ttl = self.source_client.ttl(key)

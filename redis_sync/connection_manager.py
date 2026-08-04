@@ -6,13 +6,75 @@ Redis连接管理器
 """
 
 import redis
+import inspect
 import logging
+import secrets
+import threading
 import time
 from typing import Optional, Dict, Any
 
 from .exceptions import RedisConnectionError
 
 logger = logging.getLogger(__name__)
+
+
+def assert_distinct_redis_databases(
+    source_client: redis.Redis,
+    target_client: redis.Redis,
+    source_db: int,
+    target_db: int,
+    *,
+    allow_marker: bool = True,
+) -> None:
+    """Verify Redis identity even when endpoint aliases or INFO ACLs hide it."""
+    if int(source_db) != int(target_db):
+        return
+
+    try:
+        source_info = source_client.info('server')
+        target_info = target_client.info('server')
+    except redis.RedisError:
+        source_info = target_info = {}
+    source_run_id = source_info.get('run_id') or source_info.get(b'run_id')
+    target_run_id = target_info.get('run_id') or target_info.get(b'run_id')
+    if source_run_id and target_run_id:
+        if source_run_id == target_run_id:
+            raise ValueError(
+                "目标与 source 的 Redis run_id 和 db 相同，同步会造成源数据清理"
+            )
+    if not allow_marker:
+        return
+
+    marker_key = b"__redis_sync_identity__:" + secrets.token_hex(16).encode("ascii")
+    marker_value = secrets.token_bytes(32)
+    marker_created = False
+    try:
+        marker_created = bool(
+            target_client.set(marker_key, marker_value, nx=True, px=10_000)
+        )
+        if not marker_created:
+            raise ValueError("Redis 同库标记发生冲突，请重试")
+        if source_client.get(marker_key) == marker_value:
+            raise ValueError(
+                "source 与 target 指向同一 Redis 数据库，同步会造成源数据清理"
+            )
+        if not target_client.exists(marker_key):
+            raise ValueError(
+                "Redis 同库身份标记在校验完成前失效，请重试"
+            )
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(
+            "Redis 同库身份校验失败；需要 INFO 权限，或目标 SET/EXISTS/DEL "
+            "与源 GET 权限"
+        ) from exc
+    finally:
+        if marker_created:
+            try:
+                target_client.delete(marker_key)
+            except Exception:
+                pass
 
 
 class RedisConnectionManager:
@@ -23,6 +85,9 @@ class RedisConnectionManager:
         self.target_client: Optional[redis.Redis] = None
         self._source_config: Optional[Dict[str, Any]] = None
         self._target_config: Optional[Dict[str, Any]] = None
+        self._owns_source_client = False
+        self._owns_target_client = False
+        self._close_lock = threading.Lock()
 
         # 重试配置（适用于跨境传输）
         self.retry_config = retry_config or {
@@ -35,6 +100,20 @@ class RedisConnectionManager:
         # 连接健康状态
         self._last_ping_time = {}
         self._connection_failures = {}
+
+    @staticmethod
+    def _close_client(client: Optional[redis.Redis]) -> None:
+        """Best-effort cleanup for a client that will no longer be managed."""
+        if client is None:
+            return
+        try:
+            client.close()
+        except Exception:
+            pass
+        try:
+            client.connection_pool.disconnect()
+        except Exception:
+            pass
     
     def _create_connection_config(self,
                                  host: str,
@@ -87,13 +166,18 @@ class RedisConnectionManager:
         last_error = None
 
         for attempt in range(1, max_attempts + 1):
+            client = None
             try:
                 logger.info(f"尝试连接 {name} (第 {attempt}/{max_attempts} 次)")
 
                 # 禁用 CLIENT SETINFO（腾讯云 Redis 不支持）
-                config['client_name'] = None
-                config['lib_name'] = None
-                config['lib_version'] = None
+                redis_parameters = inspect.signature(redis.Redis).parameters
+                if 'client_name' in redis_parameters:
+                    config['client_name'] = None
+                if 'lib_name' in redis_parameters:
+                    config['lib_name'] = None
+                if 'lib_version' in redis_parameters:
+                    config['lib_version'] = None
 
                 client = redis.Redis(**config)
                 # 测试连接
@@ -110,6 +194,7 @@ class RedisConnectionManager:
             except (redis.exceptions.ConnectionError,
                     redis.exceptions.TimeoutError,
                     redis.exceptions.ResponseError) as e:
+                self._close_client(client)
                 last_error = e
                 self._connection_failures[name] = self._connection_failures.get(name, 0) + 1
 
@@ -125,6 +210,7 @@ class RedisConnectionManager:
                     logger.error(f"❌ 连接 {name} 失败，已达最大重试次数: {e}")
 
             except Exception as e:
+                self._close_client(client)
                 last_error = e
                 logger.error(f"❌ 连接 {name} 时发生未预期的错误: {e}")
                 break
@@ -169,8 +255,12 @@ class RedisConnectionManager:
             connection_pool_kwargs, **kwargs
         )
 
+        new_client = self._connect_with_retry(config, f"源Redis {host}:{port}")
+        if self._owns_source_client and self.source_client is not new_client:
+            self._close_client(self.source_client)
         self._source_config = config
-        self.source_client = self._connect_with_retry(config, f"源Redis {host}:{port}")
+        self.source_client = new_client
+        self._owns_source_client = True
         return self.source_client
     
     def connect_target(self,
@@ -210,18 +300,36 @@ class RedisConnectionManager:
             connection_pool_kwargs, **kwargs
         )
 
+        new_client = self._connect_with_retry(config, f"目标Redis {host}:{port}")
+        if self._owns_target_client and self.target_client is not new_client:
+            self._close_client(self.target_client)
         self._target_config = config
-        self.target_client = self._connect_with_retry(config, f"目标Redis {host}:{port}")
+        self.target_client = new_client
+        self._owns_target_client = True
         return self.target_client
 
     def set_source_client(
         self,
         client: redis.Redis,
         config: Optional[Dict[str, Any]] = None,
+        *,
+        owned: bool = False,
     ) -> None:
         """复用已有源 Redis 客户端（一对多场景避免重复建连）。"""
         self.source_client = client
         self._source_config = config
+        self._owns_source_client = owned
+
+    def set_target_client(
+        self,
+        client: redis.Redis,
+        config: Optional[Dict[str, Any]] = None,
+        *,
+        owned: bool = False,
+    ) -> None:
+        self.target_client = client
+        self._target_config = config
+        self._owns_target_client = owned
 
     def connect_from_url(self, source_url: str, target_url: str):
         """
@@ -234,21 +342,35 @@ class RedisConnectionManager:
         Returns:
             Tuple of (source_client, target_client)
         """
+        new_source = None
+        new_target = None
         try:
-            self.source_client = redis.from_url(source_url, decode_responses=False)
-            self.source_client.ping()
+            new_source = redis.from_url(source_url, decode_responses=False)
+            new_source.ping()
             logger.info("Connected to source Redis from URL (credentials hidden)")
         except Exception as e:
+            self._close_client(new_source)
             logger.error(f"Failed to connect to source Redis from URL: {e}")
             raise
             
         try:
-            self.target_client = redis.from_url(target_url, decode_responses=False)
-            self.target_client.ping()
+            new_target = redis.from_url(target_url, decode_responses=False)
+            new_target.ping()
             logger.info("Connected to target Redis from URL (credentials hidden)")
         except Exception as e:
+            self._close_client(new_target)
+            self._close_client(new_source)
             logger.error(f"Failed to connect to target Redis from URL: {e}")
             raise
+
+        if self._owns_source_client and self.source_client is not new_source:
+            self._close_client(self.source_client)
+        if self._owns_target_client and self.target_client is not new_target:
+            self._close_client(self.target_client)
+        self.source_client = new_source
+        self.target_client = new_target
+        self._owns_source_client = True
+        self._owns_target_client = True
             
         return self.source_client, self.target_client
     
@@ -321,9 +443,15 @@ class RedisConnectionManager:
             new_client = self._connect_with_retry(config, name)
 
             if client_type == 'source':
+                if self._owns_source_client and self.source_client is not new_client:
+                    self._close_client(self.source_client)
                 self.source_client = new_client
+                self._owns_source_client = True
             else:
+                if self._owns_target_client and self.target_client is not new_client:
+                    self._close_client(self.target_client)
                 self.target_client = new_client
+                self._owns_target_client = True
 
             logger.info(f"✅ {name} 重新连接成功")
             return new_client
@@ -390,18 +518,21 @@ class RedisConnectionManager:
 
     def close_connections(self):
         """Close all Redis connections."""
-        if self.source_client:
-            try:
-                self.source_client.close()
-                logger.info("已关闭源Redis连接")
-            except Exception:
-                pass
-        if self.target_client:
-            try:
-                self.target_client.close()
-                logger.info("已关闭目标Redis连接")
-            except Exception:
-                pass
+        with self._close_lock:
+            source_client = self.source_client if self._owns_source_client else None
+            target_client = self.target_client if self._owns_target_client else None
+            if source_client is not None:
+                self.source_client = None
+                self._owns_source_client = False
+            if target_client is not None:
+                self.target_client = None
+                self._owns_target_client = False
+        if source_client is not None:
+            self._close_client(source_client)
+            logger.info("已关闭源Redis连接")
+        if target_client is not None:
+            self._close_client(target_client)
+            logger.info("已关闭目标Redis连接")
 
     def close(self):
         """Alias for close_connections"""

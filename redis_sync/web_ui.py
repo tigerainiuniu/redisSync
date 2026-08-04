@@ -5,13 +5,64 @@ Redis同步服务Web管理界面
 提供简单的Web界面来监控和管理Redis同步服务。
 """
 
-import copy
+import base64
+import binascii
+import hmac
+import ipaddress
 import json
-import time
-from typing import Dict, Any
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
 import threading
+import time
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse
+
+
+_SENSITIVE_CONFIG_FIELDS = {
+    'access_key',
+    'access_key_id',
+    'access_token',
+    'api_key',
+    'authorization',
+    'credential',
+    'credentials',
+    'dsn',
+    'encryption_key',
+    'key',
+    'password',
+    'passwd',
+    'private_key',
+    'refresh_token',
+    'secret',
+    'secret_key',
+    'token',
+    'uri',
+    'url',
+}
+
+
+def _is_sensitive_config_field(field_name):
+    normalized = str(field_name).strip().lower().replace('-', '_')
+    if normalized in _SENSITIVE_CONFIG_FIELDS:
+        return True
+    return normalized.endswith(
+        ('_password', '_secret', '_token', '_api_key', '_url', '_uri', '_dsn')
+    )
+
+
+def _redact_sensitive_config(value):
+    """Return a recursively redacted copy suitable for the config API."""
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            if _is_sensitive_config_field(key):
+                redacted[key] = '***' if item else item
+            else:
+                redacted[key] = _redact_sensitive_config(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_sensitive_config(item) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_sensitive_config(item) for item in value]
+    return value
 
 
 class WebUIHandler(BaseHTTPRequestHandler):
@@ -23,6 +74,9 @@ class WebUIHandler(BaseHTTPRequestHandler):
     
     def do_GET(self):
         """处理GET请求"""
+        if not self._authorize_request():
+            return
+
         parsed_path = urlparse(self.path)
         path = parsed_path.path
         
@@ -39,6 +93,9 @@ class WebUIHandler(BaseHTTPRequestHandler):
     
     def do_POST(self):
         """处理POST请求"""
+        if not self._authorize_request():
+            return
+
         parsed_path = urlparse(self.path)
         path = parsed_path.path
         
@@ -46,6 +103,92 @@ class WebUIHandler(BaseHTTPRequestHandler):
             self._handle_reload()
         else:
             self._serve_404()
+
+    def _authorize_request(self):
+        """Apply configured client IP and API key restrictions."""
+        config = getattr(self.sync_service, 'config', {})
+        security = config.get('security', {}) if isinstance(config, dict) else {}
+        security = security if isinstance(security, dict) else {}
+
+        allowed_ips = security.get('allowed_ips')
+        if isinstance(allowed_ips, str):
+            allowed_ips = [allowed_ips]
+
+        client_address = getattr(self, 'client_address', ('', 0))
+        client_ip = client_address[0] if client_address else ''
+        if allowed_ips and not self._client_ip_allowed(client_ip, allowed_ips):
+            self._send_response(
+                403,
+                json.dumps({'success': False, 'message': '来源地址未获准访问'}),
+                'application/json',
+            )
+            return False
+
+        if not security.get('auth_enabled', False):
+            return True
+
+        expected_api_key = security.get('api_key')
+        if not expected_api_key:
+            self._send_response(
+                503,
+                json.dumps({'success': False, 'message': 'Web API 认证配置缺少 api_key'}),
+                'application/json',
+            )
+            return False
+
+        headers = getattr(self, 'headers', {})
+        provided_api_key = headers.get('X-API-Key') if headers else None
+        if not provided_api_key and headers:
+            authorization = headers.get('Authorization', '')
+            scheme, separator, credentials = authorization.partition(' ')
+            if separator and scheme.lower() == 'bearer':
+                provided_api_key = credentials.strip()
+            elif separator and scheme.lower() == 'basic':
+                try:
+                    decoded = base64.b64decode(
+                        credentials.strip(), validate=True
+                    ).decode('utf-8')
+                    _username, colon, password = decoded.partition(':')
+                    provided_api_key = password if colon else decoded
+                except (binascii.Error, UnicodeDecodeError, ValueError):
+                    provided_api_key = None
+
+        if not provided_api_key or not hmac.compare_digest(
+            str(provided_api_key).encode('utf-8'),
+            str(expected_api_key).encode('utf-8'),
+        ):
+            self._send_response(
+                401,
+                json.dumps({'success': False, 'message': 'API key 校验失败'}),
+                'application/json',
+                headers={'WWW-Authenticate': 'Basic realm="Redis Sync"'},
+            )
+            return False
+
+        return True
+
+    @staticmethod
+    def _client_ip_allowed(client_ip, allowed_ips):
+        """Match exact IP addresses or CIDR networks without trusting proxy headers."""
+        try:
+            parsed_client_ip = ipaddress.ip_address(str(client_ip).split('%', 1)[0])
+        except ValueError:
+            return False
+
+        if isinstance(parsed_client_ip, ipaddress.IPv6Address):
+            parsed_client_ip = parsed_client_ip.ipv4_mapped or parsed_client_ip
+
+        for allowed in allowed_ips:
+            allowed_text = str(allowed).strip()
+            if allowed_text == '*':
+                return True
+            try:
+                network = ipaddress.ip_network(allowed_text, strict=False)
+            except ValueError:
+                continue
+            if parsed_client_ip in network:
+                return True
+        return False
     
     def _serve_dashboard(self):
         """提供仪表板页面"""
@@ -63,27 +206,15 @@ class WebUIHandler(BaseHTTPRequestHandler):
         self._send_response(200, json.dumps(status, indent=2), 'application/json')
     
     def _serve_config_api(self):
-        """提供配置API（深拷贝，避免修改运行时配置）"""
-        config = copy.deepcopy(self.sync_service.config)
-
-        if 'source' in config and 'password' in config['source']:
-            config['source']['password'] = '***' if config['source']['password'] else None
-
-        for target in config.get('targets', []):
-            if 'password' in target:
-                target['password'] = '***' if target['password'] else None
+        """提供经过递归脱敏的配置API。"""
+        config = _redact_sensitive_config(self.sync_service.config)
 
         self._send_response(200, json.dumps(config, indent=2), 'application/json')
     
     def _handle_reload(self):
-        """处理重新加载请求"""
-        try:
-            # 这里可以添加重新加载配置的逻辑
-            result = {'success': True, 'message': '配置重新加载成功'}
-        except Exception as e:
-            result = {'success': False, 'message': f'重新加载失败: {str(e)}'}
-        
-        self._send_response(200, json.dumps(result), 'application/json')
+        """明确报告当前服务尚未实现热加载。"""
+        result = {'success': False, 'message': '配置热加载尚未实现，请重启服务'}
+        self._send_response(501, json.dumps(result), 'application/json')
     
     def _serve_static(self, path):
         """提供静态文件"""
@@ -102,11 +233,13 @@ class WebUIHandler(BaseHTTPRequestHandler):
         html = '<html><body><h1>404 Not Found</h1></body></html>'
         self._send_response(404, html, 'text/html')
     
-    def _send_response(self, status_code, content, content_type):
+    def _send_response(self, status_code, content, content_type, headers=None):
         """发送HTTP响应"""
         self.send_response(status_code)
         self.send_header('Content-Type', content_type)
         self.send_header('Content-Length', str(len(content.encode('utf-8'))))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(content.encode('utf-8'))
     
@@ -474,7 +607,7 @@ document.addEventListener('DOMContentLoaded', () => {
 class WebUI:
     """Web UI服务器"""
     
-    def __init__(self, sync_service, host='0.0.0.0', port=8080):
+    def __init__(self, sync_service, host='127.0.0.1', port=8080):
         self.sync_service = sync_service
         self.host = host
         self.port = port

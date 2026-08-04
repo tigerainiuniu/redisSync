@@ -9,7 +9,7 @@
 
 - 🔄 **持续同步**：支持长期运行的后台同步服务
 - 🎯 **一对多同步**：一个源Redis可以同步到多个目标Redis
-- ⚡ **性能优化**：统一扫描 + 并行分发，多目标场景性能提升67%
+- ⚡ **性能优化**：单条复制流或统一扫描，并行分发到多个目标
 - 🌍 **跨境优化**：专门针对跨境远距离传输优化，支持自动重试和重连
 - 📊 **全量+增量**：支持全量同步、增量同步和混合模式
 - 🌐 **Web管理界面**：内置Web界面实时监控同步状态
@@ -46,18 +46,26 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-### 方式2: 使用 Docker（即将支持）
+### 方式2: Docker 五实例回归环境
 
 ```bash
-docker pull yourusername/redis-sync:latest
-docker run -v ./config.yaml:/app/config.yaml redis-sync
+cd docker/redis-five
+docker compose up -d
+cd ../..
+python3 scripts/e2e_five_redis.py
+docker compose -f docker/redis-five/docker-compose.yml down
 ```
+
+该 Compose 文件启动 1 个源 Redis 和 4 个目标 Redis，用于本地回归；同步服务本身仍通过 Python 启动。
 
 ### 依赖要求
 
 - Python 3.7+
-- redis-py >= 4.0.0
-- PyYAML >= 5.4.0
+- redis-py >= 4.5.0
+- Click >= 8.0.0
+- PyYAML >= 6.0
+- colorlog >= 6.0.0
+- tqdm >= 4.64.0
 
 ## 🚀 快速开始
 
@@ -115,6 +123,8 @@ source:
   port: 6379
   password: null
   db: 0
+  # 至少为启用目标数；使用 sync/psync 时再预留 1 条复制流连接
+  connection_pool_max_connections: 50
 
 # 目标Redis配置（支持多个）
 targets:
@@ -136,16 +146,27 @@ sync:
     strategy: "scan"
     batch_size: 1000
     preserve_ttl: true
+    clear_target: false
+    overwrite_existing: true
     
   incremental_sync:
     enabled: true
-    interval: 30  # 秒
-    max_changes_per_sync: 10000
+    method: "psync"
+    apply_mode: "key_state"
+    capture_max_size: 1073741824  # FULLRESYNC 对齐期间复制流缓存总上限，默认 1 GiB
+
+# Web API 访问控制
+security:
+  auth_enabled: true
+  api_key: "replace-with-a-secret"
+  allowed_ips:
+    - "127.0.0.1"
+    - "10.0.0.0/8"
 
 # Web界面配置
 web_ui:
   enabled: true
-  host: "0.0.0.0"
+  host: "127.0.0.1"
   port: 8080
 ```
 
@@ -153,41 +174,43 @@ web_ui:
 
 ### 全量同步 (Full Sync)
 - **scan**: 使用SCAN命令逐键迁移
-- **sync**: 使用SYNC命令RDB快照迁移
+- **sync**: 兼容别名；因客户端不直接装载 RDB，实际执行 SCAN+DUMP/RESTORE
 - **dump_restore**: 使用DUMP/RESTORE命令序列化迁移
+- `clear_target: false` 保留目标端仅有的键；`clear_target: true` 在复制前对目标数据库执行 `FLUSHDB`，包括过滤范围外的键
 
 ### 增量同步 (Incremental Sync)
-- 基于空闲时间检测变更
-- 支持持续监控和同步
-- 可配置同步间隔和批量大小
+- **psync（推荐）**：使用 Redis PSYNC 复制流；无法续传时接收 RDB 快照并重新对齐目标
+- **sync**：兼容别名，常驻服务会使用与 `psync` 相同的 PSYNC 复制流
+- **scan**：定时扫描，以键的序列化内容和绝对过期时间指纹检测更新、删除和 TTL 变化
+- 常驻服务默认且必须使用 `apply_mode: key_state`，按源端当前键状态执行 `RESTORE`/`DEL`，使重试保持幂等并支持键过滤；配置 `direct` 会在启动校验时被拒绝
+- `command_dedup_window` 必须为 `0`；复制流允许连续出现相同的合法写命令，按内容去重会造成数据丢失
+- TTL 以绝对毫秒时间写入目标；源 Redis、同步主机和目标 Redis 的系统时钟需保持同步，时钟偏差会等量影响过期时间
+- 目标不支持 `RESTORE ABSTTL` 时使用临时键、`PEXPIREAT` 和原子重命名保持截止时间；DUMP 格式不兼容时，字符串及常见容器类型会在 `WATCH` 保护下按类型复制，源状态变化会触发重试。stream 不走类型级降级，以保留 consumer group/PEL 语义
 
 ### 混合模式 (Hybrid)
-- 先执行全量同步
-- 然后启动增量同步
-- 适合大多数场景
+- 使用 `psync`/`sync` 时先建立 PSYNC 流和首次 `FULLRESYNC` 边界，再执行全量 DUMP/RESTORE 对齐，最后回放对齐期间捕获的复制命令，避免“先全量、后建流”遗漏并发写入
+- 捕获数据会从内存转存磁盘，内存与磁盘中的未消费复制流合计受 `capture_max_size` 限制；默认值为 `1073741824`（1 GiB），超限会中止本次复制而不静默丢弃命令
+- 首次对齐时，`clear_target: false` 保留目标端仅有的键；`clear_target: true` 会在复制流开始捕获后对每个目标数据库执行 `FLUSHDB`
+- 使用 `scan` 时先记录源快照，再执行全量迁移和对账，然后进入轮询。故障目标恢复时只重建受管范围，过滤范围外的目标键会保留
 
 ## ⚡ 多目标同步优化
 
-### 统一扫描 + 并行分发
+### 单流读取 + 并行分发
 
-当配置多个目标Redis时，系统使用优化的同步策略：
+当配置多个目标Redis时，PSYNC/SYNC 模式只读取一条源复制流，再将变更并行分发到健康目标。SCAN 轮询模式同样只构建一次源快照。
 
-**扫描一次源，并行同步到所有目标**
+**读取一次源，并行同步到所有目标**
 
 ```
 源Redis
-  ↓ SCAN 一次 ← 只扫描1次！
-  ↓ 检测变更键
+  ↓ PSYNC 复制流 / SCAN 快照
+  ↓ 解析变更
   ├─→ 目标1 (并行)
   ├─→ 目标2 (并行)
   └─→ 目标3 (并行)
 ```
 
-**性能提升**（3个目标场景）：
-- ✅ SCAN次数减少 **67%**
-- ✅ 网络流量减少 **67%**
-- ✅ 源Redis负载减少 **67%**
-- ✅ 并行同步更快
+目标写入相互隔离；单个目标失败时会从活动分发集合摘除，健康目标继续同步。故障目标恢复后，服务先在命令屏障内执行受管范围的全量对齐，再重新加入实时分发。
 
 ## 🌍 跨境远距离传输支持
 
@@ -232,8 +255,8 @@ sync:
   full_sync:
     batch_size: 500            # 减小批量大小
   incremental_sync:
-    interval: 10               # 10秒同步间隔
-    max_changes_per_sync: 5000
+    method: "psync"
+    apply_mode: "key_state"
 
 service:
   retry:
@@ -248,8 +271,6 @@ service:
     recovery_delay: 120        # 2分钟恢复延迟
 ```
 
-详细说明请查看：[跨境传输优化说明.md](跨境传输优化说明.md)
-
 ## 🌐 Web管理界面
 
 Web界面提供以下功能：
@@ -260,6 +281,20 @@ Web界面提供以下功能：
 - ⚙️ **配置查看**：查看当前配置信息
 
 访问地址：http://localhost:8080
+
+启用 `security.auth_enabled` 后，页面和 API 都会执行 IP/CIDR 与 API key 校验。以下三种认证方式等价：
+
+```bash
+curl -H 'X-API-Key: replace-with-a-secret' http://localhost:8080/api/status
+curl -H 'Authorization: Bearer replace-with-a-secret' http://localhost:8080/api/status
+curl -u 'redis-sync:replace-with-a-secret' http://localhost:8080/api/status
+```
+
+Basic Auth 的用户名可自行设置，密码位必须是 `security.api_key`。`/api/config` 会递归隐藏密码、token、API key、URL/DSN 等敏感字段。
+
+### 连接池容量
+
+`source.connection_pool_max_connections` 至少应等于启用目标数。若 `sync.mode` 为 `incremental`/`hybrid` 且 `incremental_sync.method` 为 `sync`/`psync`，还需为复制流增加 1 条连接。例如 4 个启用目标使用 PSYNC 时，最小值为 5；配置校验会拒绝更小的值。
 
 ## 🛠️ 高级功能
 
@@ -327,14 +362,15 @@ redis-cli -h <host> -p <port> -a <password> ping
 python run_sync_service.py --check-config
 ```
 
-#### 2. 同步生效很慢
+#### 2. 轮询同步生效很慢
 
 **问题**：修改源数据后，目标库很久才更新
 
-**解决方案**：减小同步间隔
+**解决方案**：新部署使用 `method: psync`。若明确使用 `scan` 轮询，可减小同步间隔：
 ```yaml
 sync:
   incremental_sync:
+    method: "scan"
     interval: 5  # 从30秒改为5秒（推荐）
 ```
 
@@ -371,8 +407,14 @@ sync:
     batch_size: 500  # 减小批量大小
 service:
   performance:
-    memory_limit: 536870912  # 限制为512MB
+    pipeline_batch_size: 50  # 减小单次 Pipeline 键数
+    scan_count: 2000         # 减小单次 SCAN 返回规模
+    memory_limit: 536870912  # 前后两份 SCAN 指纹快照的估算上限
 ```
+
+超过 `memory_limit` 时本轮 SCAN 会失败且不推进检查点；它不是操作系统级进程内存硬限制。
+`queue_size`、内置指标采集、通知和配置加密字段仅为配置兼容保留，
+当前版本不启动对应的队列、指标、通知或加密组件。
 
 ### 日志分析
 ```bash
@@ -393,10 +435,11 @@ tail -f redis-sync.log | grep "变更键数"
 
 ### 快速优化（提升同步速度）
 
-**修改同步间隔**（最有效）：
+**轮询模式修改同步间隔**：
 ```yaml
 sync:
   incremental_sync:
+    method: "scan"
     interval: 5  # 推荐：5秒
 ```
 
@@ -423,8 +466,8 @@ sync:
 sync:
   mode: "hybrid"
   incremental_sync:
-    interval: 5  # 5秒同步
-    max_changes_per_sync: 5000
+    method: "psync"
+    apply_mode: "key_state"
 service:
   performance:
     max_workers: 8
@@ -435,6 +478,7 @@ service:
 sync:
   mode: "hybrid"
   incremental_sync:
+    method: "scan"
     interval: 10  # 10秒同步
     max_changes_per_sync: 10000
 service:
@@ -447,6 +491,7 @@ service:
 sync:
   mode: "hybrid"
   incremental_sync:
+    method: "scan"
     interval: 60  # 60秒同步
     max_changes_per_sync: 5000
 service:
@@ -466,20 +511,20 @@ service:
 ## ❓ 常见问题 FAQ
 
 ### Q1: 使用的是SCAN还是SYNC命令？
-**A**: 使用 **SCAN** 命令。
-- 全量同步：使用SCAN逐键扫描（默认策略）
-- 增量同步：使用SCAN + OBJECT IDLETIME检测变更
-- 优点：不阻塞Redis，对生产环境友好
-- 如需使用SYNC：修改配置 `strategy: "sync"`
+**A**: 由全量和增量配置分别决定。
+- 全量同步默认 `full_sync.strategy: scan`，也支持 `sync` 和 `dump_restore`
+- 常驻增量同步推荐 `incremental_sync.method: psync`；`sync` 是 PSYNC 兼容别名，也支持轮询 `scan`
+- `strategy` 只控制全量迁移；`method` 控制常驻增量同步
 
 ### Q2: 如何加快同步速度？
-**A**: 修改配置文件中的同步间隔：
+**A**: 对实时性要求高时使用 PSYNC：
 ```yaml
 sync:
   incremental_sync:
-    interval: 5  # 从30改为5秒
+    method: "psync"
+    apply_mode: "key_state"
 ```
-然后重启服务。
+SCAN 轮询模式才通过 `interval` 调整检测周期。
 
 ### Q3: 支持多少个目标Redis？
 **A**: 理论上无限制，实际取决于：
@@ -532,15 +577,19 @@ redis-cli -h <host> -p <port> -a <password> ping
 
 ```bash
 # 克隆仓库
-git clone https://github.com/yourusername/redisSync.git
+git clone https://github.com/tigerainiuniu/redisSync.git
 cd redisSync
 
 # 安装开发依赖
 pip install -r requirements.txt
 pip install -e .
 
-# 运行测试（如果有）
-python -m pytest
+# 运行完整测试
+python3 -m pytest tests -q
+
+# 基础静态校验
+python3 -m compileall -q redis_sync run_sync_service.py scripts
+python3 setup.py check
 
 # 代码风格检查
 flake8 redis_sync/
@@ -548,7 +597,7 @@ flake8 redis_sync/
 
 ### 报告问题
 
-如果发现bug或有功能建议，请[创建Issue](https://github.com/yourusername/redisSync/issues)。
+如果发现bug或有功能建议，请[创建Issue](https://github.com/tigerainiuniu/redisSync/issues)。
 
 请包含：
 - 问题描述
@@ -566,11 +615,12 @@ flake8 redis_sync/
 2. **查看日志**：`tail -f redis-sync.log`
 3. **检查配置**：`python run_sync_service.py --check-config`
 4. **Web界面**：http://localhost:8080
-5. **提交Issue**：[GitHub Issues](https://github.com/yourusername/redisSync/issues)
+5. **提交Issue**：[GitHub Issues](https://github.com/tigerainiuniu/redisSync/issues)
 
 ## 🗺️ 路线图
 
-- [ ] Docker支持
+- [x] Docker 五实例本地回归环境
+- [ ] 同步服务容器镜像
 - [ ] 更多同步策略（基于时间戳、版本号等）
 - [ ] 数据压缩传输
 - [ ] 更详细的性能监控
@@ -596,4 +646,4 @@ Copyright (c) 2025 redisSync Contributors
 
 如果这个项目对你有帮助，请给个 Star ⭐️
 
-[![Star History Chart](https://api.star-history.com/svg?repos=yourusername/redisSync&type=Date)](https://star-history.com/#yourusername/redisSync&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=tigerainiuniu/redisSync&type=Date)](https://star-history.com/#tigerainiuniu/redisSync&Date)

@@ -4,16 +4,21 @@ Redis Sync工具的命令行界面。
 为Redis迁移和同步操作提供全面的CLI。
 """
 
-import click
+import json
+import socket
 import sys
 import time
-import json
-from typing import Optional
-from pathlib import Path
+
+import click
+import redis
 from tqdm import tqdm
+from urllib.parse import parse_qs, urlparse
 
 from .config import Config, setup_logging, create_sample_config, load_config
-from .connection_manager import RedisConnectionManager
+from .connection_manager import (
+    RedisConnectionManager,
+    assert_distinct_redis_databases,
+)
 from .migration_orchestrator import MigrationOrchestrator, MigrationConfig, MigrationStrategy
 
 
@@ -68,31 +73,37 @@ def init(output):
 
 @cli.command()
 @click.option('--strategy', '-s',
-              type=click.Choice(['scan', 'sync', 'psync', 'hybrid', 'full', 'incremental']),
-              help='迁移策略')
+              type=click.Choice([
+                  'scan', 'sync', 'dump_restore', 'full', 'incremental'
+              ]),
+              help='迁移策略（全量迁移使用 scan、sync 或 dump_restore）')
 @click.option('--migration-type',
               type=click.Choice(['full', 'incremental']),
-              default='full', help='迁移类型：全量或增量')
+              default=None, help='迁移类型：全量或增量')
 @click.option('--full-strategy',
               type=click.Choice(['scan', 'sync', 'dump_restore']),
-              default='scan', help='全量迁移子策略')
-@click.option('--pattern', '-p', default='*', help='要迁移的键模式')
+              default=None, help='全量迁移子策略')
+@click.option('--pattern', '-p', default=None, help='要迁移的键模式')
 @click.option('--key-type', '-t',
               type=click.Choice(['string', 'list', 'set', 'zset', 'hash', 'stream']),
               help='按键类型过滤')
-@click.option('--batch-size', '-b', type=int, help='处理批大小')
+@click.option('--batch-size', '-b', type=click.IntRange(min=1), help='处理批大小')
 @click.option('--overwrite', is_flag=True, help='覆盖现有键')
 @click.option('--no-ttl', is_flag=True, help='不保持TTL值')
 @click.option('--no-verify', is_flag=True, help='跳过迁移验证')
 @click.option('--enable-replication', is_flag=True, help='启用持续复制')
 @click.option('--clear-target', is_flag=True, help='清空目标数据库（仅全量迁移）')
-@click.option('--sync-interval', type=int, default=60, help='增量同步间隔（秒）')
-@click.option('--max-changes', type=int, default=10000, help='每次同步的最大变更数')
+@click.option('--sync-interval', type=click.IntRange(min=1), default=None,
+              help='增量同步间隔（秒）')
+@click.option('--max-changes', type=click.IntRange(min=1), default=None,
+              help='每次同步的最大变更数')
 @click.option('--continuous', is_flag=True, help='启用持续增量同步')
 @click.option('--include', multiple=True, help='键名包含模式（glob），可多次指定')
 @click.option('--exclude', multiple=True, help='键名排除模式（glob），可多次指定')
-@click.option('--min-ttl', type=int, default=0, help='最小TTL过滤（秒）')
-@click.option('--max-key-size', type=int, default=0, help='最大键内存过滤（字节）')
+@click.option('--min-ttl', type=click.IntRange(min=0), default=None,
+              help='最小TTL过滤（秒）')
+@click.option('--max-key-size', type=click.IntRange(min=0), default=None,
+              help='最大键内存过滤（字节）')
 @click.option('--dry-run', is_flag=True, help='显示将要迁移的内容而不实际执行')
 @click.pass_context
 def migrate(ctx, strategy, migration_type, full_strategy, pattern, key_type, batch_size,
@@ -101,18 +112,17 @@ def migrate(ctx, strategy, migration_type, full_strategy, pattern, key_type, bat
            include, exclude, min_ttl, max_key_size, dry_run):
     """从源Redis实例迁移数据到目标Redis实例。"""
     config = ctx.obj['config']
+    requested_strategy = strategy
+    requested_full_strategy = full_strategy
 
     # 使用CLI选项覆盖配置
     if strategy:
         config.migration.strategy = strategy
-    if migration_type:
-        # 设置迁移类型
-        pass  # 将在创建MigrationConfig时处理
-    if pattern:
+    if pattern is not None:
         config.migration.key_pattern = pattern
     if key_type:
         config.migration.key_type = key_type
-    if batch_size:
+    if batch_size is not None:
         config.migration.batch_size = batch_size
     if overwrite:
         config.migration.overwrite_existing = True
@@ -120,8 +130,91 @@ def migrate(ctx, strategy, migration_type, full_strategy, pattern, key_type, bat
         config.migration.preserve_ttl = False
     if no_verify:
         config.migration.verify_migration = False
-    if enable_replication:
-        config.migration.enable_replication = True
+    if enable_replication or config.migration.enable_replication:
+        raise click.UsageError(
+            "--enable-replication 不适用于一次性 migrate 命令；"
+            "请在常驻服务配置 sync.incremental_sync.method 中使用 psync"
+        )
+
+    configured_strategy = config.migration.strategy
+    if migration_type is None and configured_strategy in {'full', 'incremental'}:
+        migration_type = configured_strategy
+    migration_type = (
+        migration_type
+        or getattr(config.migration, 'migration_type', None)
+        or 'full'
+    )
+
+    if migration_type == 'full':
+        if requested_strategy == 'incremental':
+            raise click.UsageError(
+                "--strategy incremental 与 --migration-type full 冲突"
+            )
+        if (
+            requested_strategy in {'scan', 'sync', 'dump_restore'}
+            and requested_full_strategy is not None
+            and requested_strategy != requested_full_strategy
+        ):
+            raise click.UsageError(
+                "--strategy 与 --full-strategy 指定了不同的全量迁移策略"
+            )
+        if continuous:
+            raise click.UsageError("--continuous 仅适用于增量迁移")
+        if sync_interval is not None:
+            raise click.UsageError("--sync-interval 仅适用于增量迁移")
+        if max_changes is not None:
+            raise click.UsageError("--max-changes 仅适用于增量迁移")
+    else:
+        if requested_strategy not in {None, 'incremental'}:
+            raise click.UsageError(
+                f"--strategy {requested_strategy} 与 "
+                "--migration-type incremental 冲突"
+            )
+        if requested_full_strategy is not None:
+            raise click.UsageError("--full-strategy 仅适用于全量迁移")
+        if clear_target:
+            raise click.UsageError("--clear-target 仅适用于全量迁移")
+        if batch_size is not None:
+            raise click.UsageError("--batch-size 不受增量迁移支持")
+        if overwrite:
+            raise click.UsageError("--overwrite 不受增量迁移支持")
+        if no_ttl:
+            raise click.UsageError(
+                "--no-ttl 不受增量迁移支持；增量迁移始终同步源键 TTL"
+            )
+        if no_verify:
+            raise click.UsageError("--no-verify 不受增量迁移支持")
+
+    if full_strategy is None:
+        full_strategy = getattr(config.migration, 'full_strategy', None)
+    if full_strategy is None and configured_strategy in {
+        'scan', 'sync', 'dump_restore'
+    }:
+        full_strategy = configured_strategy
+    if full_strategy is None:
+        if configured_strategy in {'full', 'incremental'}:
+            full_strategy = 'scan'
+        else:
+            raise click.UsageError(
+                f"策略 {configured_strategy!r} 不能作为全量迁移子策略；"
+                "请指定 --full-strategy scan、sync 或 dump_restore"
+            )
+    if sync_interval is None:
+        sync_interval = getattr(config.migration, 'sync_interval', None)
+        if sync_interval is None:
+            sync_interval = 60
+    if max_changes is None:
+        max_changes = getattr(config.migration, 'max_changes_per_sync', None)
+        if max_changes is None:
+            max_changes = 10000
+    if min_ttl is None:
+        min_ttl = getattr(config.migration, 'filter_min_ttl', None)
+        if min_ttl is None:
+            min_ttl = 0
+    if max_key_size is None:
+        max_key_size = getattr(config.migration, 'filter_max_key_size', None)
+        if max_key_size is None:
+            max_key_size = 0
     
     if dry_run:
         click.echo("DRY RUN MODE - No actual migration will be performed")
@@ -132,7 +225,9 @@ def migrate(ctx, strategy, migration_type, full_strategy, pattern, key_type, bat
     try:
         with RedisConnectionManager() as conn_manager:
             # Connect to Redis instances
-            _connect_redis_instances(conn_manager, config)
+            _connect_redis_instances(
+                conn_manager, config, require_identity_probe=True
+            )
             
             # Initialize orchestrator
             orchestrator = MigrationOrchestrator(conn_manager)
@@ -205,13 +300,18 @@ def migrate(ctx, strategy, migration_type, full_strategy, pattern, key_type, bat
 
 
 @cli.command()
-@click.option('--pattern', '-p', default='*', help='Key pattern to compare')
-@click.option('--sample-size', '-n', type=int, help='Limit comparison to sample size')
+@click.option('--pattern', '-p', default=None, help='Key pattern to compare')
+@click.option(
+    '--sample-size', '-n', type=click.IntRange(min=1),
+    help='Limit comparison to sample size',
+)
 @click.option('--output', '-o', type=click.Path(), help='Save comparison results to file')
 @click.pass_context
 def compare(ctx, pattern, sample_size, output):
     """Compare keys between source and target Redis instances."""
     config = ctx.obj['config']
+    if pattern is None:
+        pattern = config.migration.key_pattern
     
     try:
         with RedisConnectionManager() as conn_manager:
@@ -296,24 +396,92 @@ def info(ctx):
         sys.exit(1)
 
 
-def _connect_redis_instances(conn_manager: RedisConnectionManager, config: Config):
+def _connect_redis_instances(
+    conn_manager: RedisConnectionManager,
+    config: Config,
+    *,
+    require_identity_probe: bool = False,
+):
     """Connect to source and target Redis instances."""
+    if _redis_configs_share_endpoint(config.source, config.target):
+        raise ValueError(
+            "source 与 target 指向同一 Redis 数据库，迁移可能清空源数据"
+        )
+
     # Connect to source
     if config.source.url:
-        source_client = conn_manager.source_client = conn_manager.connect_from_url(
-            config.source.url, config.target.url or "redis://localhost:6380"
-        )[0]
+        source_client = redis.from_url(
+            config.source.url, decode_responses=False
+        )
+        source_client.ping()
+        conn_manager.set_source_client(source_client, owned=True)
     else:
-        source_client = conn_manager.connect_source(**config.source.to_dict())
+        conn_manager.connect_source(**config.source.to_dict())
     
     # Connect to target
     if config.target.url:
-        if not config.source.url:
-            target_client = conn_manager.target_client = conn_manager.connect_from_url(
-                "redis://localhost:6379", config.target.url
-            )[1]
+        target_client = redis.from_url(
+            config.target.url, decode_responses=False
+        )
+        target_client.ping()
+        conn_manager.set_target_client(target_client, owned=True)
     else:
-        target_client = conn_manager.connect_target(**config.target.to_dict())
+        conn_manager.connect_target(**config.target.to_dict())
+
+    source_db = _redis_config_endpoint(config.source)[2]
+    target_db = _redis_config_endpoint(config.target)[2]
+    assert_distinct_redis_databases(
+        conn_manager.source_client,
+        conn_manager.target_client,
+        source_db,
+        target_db,
+        allow_marker=require_identity_probe,
+    )
+
+
+def _redis_config_endpoint(config):
+    """Return the effective host/port/db tuple before opening a connection."""
+    if config.url:
+        parsed = urlparse(config.url)
+        query = parse_qs(parsed.query)
+        if parsed.scheme == "unix":
+            db = int(query["db"][-1]) if query.get("db") else 0
+            return (f"unix:{parsed.path}", 0, db)
+        if query.get("db"):
+            db = int(query["db"][-1])
+        elif parsed.path and parsed.path != "/":
+            db = int(parsed.path.strip("/") or 0)
+        else:
+            db = 0
+        return ((parsed.hostname or "").lower(), parsed.port or 6379, db)
+    return (str(config.host).strip().lower(), int(config.port), int(config.db))
+
+
+def _redis_configs_share_endpoint(source, target):
+    """Check host aliases as well as literal endpoint equality."""
+    source_host, source_port, source_db = _redis_config_endpoint(source)
+    target_host, target_port, target_db = _redis_config_endpoint(target)
+    if source_port != target_port or source_db != target_db:
+        return False
+    if source_host == target_host:
+        return True
+    if source_host.startswith("unix:") or target_host.startswith("unix:"):
+        return False
+
+    def _addresses(host, port):
+        try:
+            return {
+                address[4][0].lower()
+                for address in socket.getaddrinfo(
+                    host, port, type=socket.SOCK_STREAM
+                )
+            }
+        except OSError:
+            return set()
+
+    source_addresses = _addresses(source_host, source_port)
+    target_addresses = _addresses(target_host, target_port)
+    return bool(source_addresses and source_addresses.intersection(target_addresses))
 
 
 def _show_migration_plan(config: Config):

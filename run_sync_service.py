@@ -103,7 +103,7 @@ def main():
             # 显示Web UI配置
             web_ui = config.get('web_ui', {})
             if web_ui.get('enabled', True):
-                host = web_ui.get('host', '0.0.0.0')
+                host = web_ui.get('host', '127.0.0.1')
                 port = web_ui.get('port', 8080)
                 print(f"🌐 Web管理界面: http://{host}:{port}")
             
@@ -116,7 +116,7 @@ def main():
         # 显示Web UI地址
         web_ui = service.config.get('web_ui', {})
         if web_ui.get('enabled', True):
-            host = web_ui.get('host', '0.0.0.0')
+            host = web_ui.get('host', '127.0.0.1')
             port = web_ui.get('port', 8080)
             if host == '0.0.0.0':
                 print(f"🌐 Web管理界面: http://localhost:{port}")

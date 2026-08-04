@@ -29,6 +29,7 @@ class MigrationStrategy(Enum):
     SYNC = "sync"
     PSYNC = "psync"
     HYBRID = "hybrid"
+    DUMP_RESTORE = "dump_restore"
     FULL = "full"  # 全量迁移
     INCREMENTAL = "incremental"  # 增量迁移
 
@@ -63,7 +64,7 @@ class MigrationConfig:
 
     # 全量迁移特定配置
     clear_target: bool = False  # 是否清空目标数据库
-    full_strategy: str = "scan"  # 全量迁移子策略: scan, sync, dump_restore
+    full_strategy: Optional[str] = None  # 全量迁移子策略: scan, sync, dump_restore
 
     # 增量迁移特定配置
     sync_interval: int = 60  # 增量同步间隔（秒）
@@ -155,6 +156,12 @@ class MigrationOrchestrator:
         返回:
             迁移结果和统计信息
         """
+        if config.enable_replication:
+            raise ConfigurationError(
+                "enable_replication 不适用于一次性迁移；"
+                "常驻复制请使用服务配置 sync.incremental_sync.method=psync"
+            )
+
         if not self.sync_handler or not self.scan_handler or not self.replconf_handler:
             self.initialize_handlers()
 
@@ -177,6 +184,7 @@ class MigrationOrchestrator:
             # 根据迁移类型选择处理方式
             if config.migration_type == MigrationType.FULL:
                 full_res = self._perform_full_migration(config)
+                results['strategy'] = full_res.get('strategy', results['strategy'])
                 results['statistics'] = full_res.get('statistics', {})
                 migration_ok = bool(full_res.get('success', True))
                 if not migration_ok:
@@ -211,6 +219,8 @@ class MigrationOrchestrator:
                     logger.info(f"✅ 迁移验证通过 (耗时: {verify_elapsed:.2f}秒)")
                 else:
                     logger.warning(f"⚠️  迁移验证失败 (耗时: {verify_elapsed:.2f}秒)")
+                    migration_ok = False
+                    results['errors'].append('迁移验证失败')
 
             results['success'] = migration_ok and not results['errors']
             if results['success']:
@@ -240,7 +250,23 @@ class MigrationOrchestrator:
         if not self.full_migration_handler:
             raise RuntimeError("全量迁移处理器未初始化")
 
-        logger.info(f"开始全量迁移，子策略: {config.full_strategy}")
+        full_strategy = config.full_strategy
+        if full_strategy is None:
+            if config.strategy in {
+                MigrationStrategy.SCAN,
+                MigrationStrategy.SYNC,
+                MigrationStrategy.DUMP_RESTORE,
+            }:
+                full_strategy = config.strategy.value
+            elif config.strategy == MigrationStrategy.FULL:
+                full_strategy = "scan"
+            else:
+                raise ConfigurationError(
+                    f"策略 {config.strategy.value!r} 不是有效的全量迁移子策略；"
+                    "请使用 scan、sync 或 dump_restore"
+                )
+
+        logger.info(f"开始全量迁移，子策略: {full_strategy}")
 
         # 准备键类型列表
         key_types = None
@@ -250,7 +276,7 @@ class MigrationOrchestrator:
             key_types = config.key_types
 
         return self.full_migration_handler.perform_full_migration(
-            strategy=config.full_strategy,
+            strategy=full_strategy,
             clear_target=config.clear_target,
             preserve_ttl=config.preserve_ttl,
             batch_size=config.batch_size,
@@ -259,6 +285,7 @@ class MigrationOrchestrator:
             key_pattern=config.key_pattern,
             key_types=key_types,
             key_filter=key_filter_from_migration_config(config),
+            overwrite_existing=config.overwrite_existing,
         )
 
     def _perform_incremental_migration(self, config: MigrationConfig) -> Dict[str, Any]:
@@ -287,6 +314,7 @@ class MigrationOrchestrator:
             )
 
             return {
+                'success': success,
                 'continuous_sync_started': success,
                 'sync_interval': config.sync_interval,
                 'max_changes_per_sync': config.max_changes_per_sync
@@ -476,14 +504,23 @@ class MigrationOrchestrator:
             comparison_results = self.scan_handler.compare_keys(
                 pattern=config.key_pattern,
                 sample_size=sample_size,
-                use_fast_mode=use_fast_mode
+                use_fast_mode=use_fast_mode,
+                key_types=(
+                    [config.key_type]
+                    if config.key_type
+                    else config.key_types
+                ),
+                key_filter=key_filter_from_migration_config(config),
             )
 
             total_compared = comparison_results.get('total_compared', 0)
             matching_keys = comparison_results.get('matching_keys', 0)
 
             success_rate = matching_keys / max(total_compared, 1)
-            verification_success = success_rate >= 0.95  # 95% success threshold
+            verification_success = (
+                not comparison_results.get('errors')
+                and (total_compared == 0 or success_rate == 1.0)
+            )
 
             return {
                 'success': verification_success,

@@ -21,7 +21,6 @@ All notable changes to this project will be documented in this file.
 
 - `verify_mode` 默认值调整为 `full`；三处 `scan_count` 配置的硬上限统一为 `100000`。
 - systemd 示例改用专用账号、固定配置路径、journald 和有限权限。
-- 新增 Python 3.7、3.8、3.9 和 3.12 的 GitHub Actions 测试矩阵，测试警告按错误处理。
 
 ## [1.0.0] - 2025-01-03
 
@@ -95,7 +94,7 @@ All notable changes to this project will be documented in this file.
 - [ ] 更多的同步策略
 - [ ] 性能基准测试
 - [ ] 单元测试覆盖
-- [x] Python 3.7-3.12 测试 CI
+- [ ] CI/CD 集成
 - [ ] 多语言文档（英文）
 - [ ] 监控指标导出（Prometheus）
 - [ ] 数据压缩传输

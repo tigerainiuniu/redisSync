@@ -2,7 +2,6 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.7+](https://img.shields.io/badge/python-3.7+-blue.svg)](https://www.python.org/downloads/)
-[![Tests](https://github.com/tigerainiuniu/redisSync/actions/workflows/tests.yml/badge.svg)](https://github.com/tigerainiuniu/redisSync/actions/workflows/tests.yml)
 
 一个高性能、支持一对多Redis实例持续同步的服务，专为跨境远距离传输优化。
 
@@ -68,8 +67,6 @@ docker compose -f docker/redis-five/docker-compose.yml down
 - PyYAML >= 6.0
 - colorlog >= 6.0.0
 - tqdm >= 4.64.0
-
-GitHub Actions 会在 Python 3.7、3.8、3.9 和 3.12 上执行完整测试，并将运行时警告视为失败。
 
 ## 🚀 快速开始
 

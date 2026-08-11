@@ -8,21 +8,29 @@
 import redis
 import logging
 import time
+import threading
 from typing import Optional, Callable, Dict, Any, List
 from datetime import datetime
 
 from .exceptions import MigrationError, SyncError
 from .key_sync import (
+    CapturedDumpState,
+    MAX_DUMP_BATCH_BYTES,
+    _execute_pipeline_allowing_errors,
     _is_absttl_compatibility_error,
     _is_busykey_error,
     _is_restore_compatibility_error,
     _sync_key_fallback,
+    cache_source_pexpiretime_support,
+    capture_dump_with_preflight,
+    is_pexpiretime_capability_error,
     restore_dump_with_deadline,
     source_supports_pexpiretime,
 )
 from .sync_filters import (
     KeySyncFilter,
     build_atomic_filtered_delete_command,
+    redis_glob_match,
     source_state_in_dynamic_scope,
 )
 from .utils import ProgressTracker, format_bytes, format_duration
@@ -48,7 +56,12 @@ class FullMigrationHandler:
     SCAN_MAX_RETRIES = 3
     SCAN_RETRY_DELAY = 0.1
     
-    def __init__(self, source_client: redis.Redis, target_client: redis.Redis):
+    def __init__(
+        self,
+        source_client: redis.Redis,
+        target_client: redis.Redis,
+        stop_event: Optional[threading.Event] = None,
+    ):
         """
         初始化全量迁移处理器。
         
@@ -58,6 +71,7 @@ class FullMigrationHandler:
         """
         self.source_client = source_client
         self.target_client = target_client
+        self.stop_event = stop_event
         self.migration_start_time = None
         self.migration_stats = {
             'total_keys': 0,
@@ -69,6 +83,10 @@ class FullMigrationHandler:
             'end_time': None
         }
 
+    def _raise_if_cancelled(self) -> None:
+        if self.stop_event is not None and self.stop_event.is_set():
+            raise MigrationError("全量迁移已取消")
+
     def _filter_keys_by_types(
         self,
         keys: List[bytes],
@@ -78,6 +96,7 @@ class FullMigrationHandler:
         filtered_keys = []
         pipeline_batch_size = _bounded_pipeline_batch_size(batch_size)
         for offset in range(0, len(keys), pipeline_batch_size):
+            self._raise_if_cancelled()
             chunk = keys[offset:offset + pipeline_batch_size]
             pipe = self.source_client.pipeline(transaction=False)
             for key in chunk:
@@ -145,11 +164,13 @@ class FullMigrationHandler:
 
         try:
             try:
+                self._raise_if_cancelled()
                 if strategy not in self.SUPPORTED_STRATEGIES:
                     raise MigrationError(f"不支持的迁移策略: {strategy}")
 
                 # 清空目标数据库（如果需要）
                 if clear_target:
+                    self._raise_if_cancelled()
                     self._clear_target_database()
 
                 # 根据策略执行迁移
@@ -220,7 +241,11 @@ class FullMigrationHandler:
         logger.info(f"使用SCAN策略进行全量迁移（scan_count={scan_count}）")
         
         # 估算总键数
-        total_keys = self._estimate_key_count(key_pattern, key_types)
+        total_keys = self._estimate_key_count(
+            key_pattern,
+            key_types,
+            getattr(self, "_key_filter", None),
+        )
         self.migration_stats['total_keys'] = total_keys
         
         progress_tracker = ProgressTracker(total_keys, "SCAN全量迁移")
@@ -231,8 +256,10 @@ class FullMigrationHandler:
         
         cursor = 0
         while True:
+            self._raise_if_cancelled()
             # 扫描键（使用scan_count参数）
             cursor, keys = self._scan_page(cursor, key_pattern, scan_count)
+            self._raise_if_cancelled()
                 
             if keys:
                 if getattr(self, "_key_filter", None):
@@ -244,6 +271,7 @@ class FullMigrationHandler:
                         break
                     continue
                 for offset in range(0, len(keys), pipeline_batch_size):
+                    self._raise_if_cancelled()
                     batch = keys[offset:offset + pipeline_batch_size]
                     batch_result = self._migrate_key_batch(
                         batch, preserve_ttl, overwrite_existing
@@ -316,7 +344,11 @@ class FullMigrationHandler:
         logger.info(f"使用DUMP/RESTORE策略进行全量迁移（scan_count={scan_count}）")
         
         # 估算总键数
-        total_keys = self._estimate_key_count(key_pattern, key_types)
+        total_keys = self._estimate_key_count(
+            key_pattern,
+            key_types,
+            getattr(self, "_key_filter", None),
+        )
         self.migration_stats['total_keys'] = total_keys
         
         progress_tracker = ProgressTracker(total_keys, "DUMP/RESTORE全量迁移")
@@ -327,8 +359,10 @@ class FullMigrationHandler:
         
         cursor = 0
         while True:
+            self._raise_if_cancelled()
             # 扫描键（使用scan_count参数）
             cursor, keys = self._scan_page(cursor, key_pattern, scan_count)
+            self._raise_if_cancelled()
                 
             if keys:
                 if getattr(self, "_key_filter", None):
@@ -340,6 +374,7 @@ class FullMigrationHandler:
                         break
                     continue
                 for offset in range(0, len(keys), pipeline_batch_size):
+                    self._raise_if_cancelled()
                     batch = keys[offset:offset + pipeline_batch_size]
                     batch_result = self._dump_restore_batch(
                         batch, preserve_ttl, overwrite_existing
@@ -418,6 +453,7 @@ class FullMigrationHandler:
             active_params.get('batch_size', MAX_PIPELINE_KEYS)
         )
         for offset in range(0, len(candidates), pipeline_batch_size):
+            self._raise_if_cancelled()
             result = self._dump_restore_chunk(
                 candidates[offset:offset + pipeline_batch_size],
                 preserve_ttl,
@@ -433,7 +469,7 @@ class FullMigrationHandler:
         preserve_ttl: bool,
         overwrite_existing: bool = False,
     ) -> Dict[str, int]:
-        """Run one DUMP/RESTORE pipeline chunk of at most 200 keys."""
+        """Capture pre-sized key groups and write bounded RESTORE pipelines."""
         migrated = 0
         failed = 0
         skipped = 0
@@ -450,8 +486,12 @@ class FullMigrationHandler:
                 return {'migrated': 0, 'failed': len(keys), 'skipped': 0}
 
             pending = []
-            for key, exists in zip(candidates, exists_results):
-                if isinstance(exists, Exception):
+            for index, key in enumerate(candidates):
+                if index >= len(exists_results):
+                    failed += 1
+                    continue
+                exists = exists_results[index]
+                if isinstance(exists, BaseException):
                     failed += 1
                 elif exists:
                     skipped += 1
@@ -467,47 +507,50 @@ class FullMigrationHandler:
         key_filter = getattr(self, '_key_filter', None)
         min_ttl = key_filter.min_ttl if key_filter else 0
         max_key_size = key_filter.max_key_size if key_filter else 0
-        needs_type = bool(key_types)
-        needs_memory = max_key_size > 0
         has_dynamic_filters = bool(key_types or min_ttl > 0 or max_key_size > 0)
 
-        try:
-            # Keep payload, TTL, type and memory usage in one source state.
-            has_pexpiretime = preserve_ttl and source_supports_pexpiretime(
-                self.source_client, candidates[0]
-            )
-            pipe = self.source_client.pipeline(transaction=True)
-            for key in candidates:
-                pipe.dump(key)
-                pipe.pttl(key)
-                if has_pexpiretime:
-                    pipe.execute_command('PEXPIRETIME', key)
-                if needs_type:
-                    pipe.type(key)
-                if needs_memory:
-                    pipe.execute_command('MEMORY', 'USAGE', key)
-            pttl_sample_started_ns = time.monotonic_ns()
-            results = pipe.execute(raise_on_error=False)
-            observed_at_ms = int(time.time() * 1000)
-            elapsed_ms = (
-                max(0, time.monotonic_ns() - pttl_sample_started_ns)
-                + 999_999
-            ) // 1_000_000
-        except Exception as e:
-            logger.error("DUMP/PTTL批量读取失败: %s", e)
-            return {
-                'migrated': migrated,
-                'failed': failed + len(candidates),
-                'skipped': skipped,
-            }
-
         adjusted_operations = []
-        stride = (
-            2
-            + int(has_pexpiretime)
-            + int(needs_type)
-            + int(needs_memory)
-        )
+        queued_payload_bytes = 0
+
+        def flush_operations() -> None:
+            nonlocal adjusted_operations
+            nonlocal queued_payload_bytes
+            nonlocal migrated
+            nonlocal failed
+            nonlocal skipped
+            if not adjusted_operations:
+                return
+            self._raise_if_cancelled()
+            result = self._write_dump_operations(
+                adjusted_operations,
+                preserve_ttl=preserve_ttl,
+                overwrite_existing=overwrite_existing,
+                key_types=key_types,
+                min_ttl=min_ttl,
+                max_key_size=max_key_size,
+            )
+            migrated += result['migrated']
+            failed += result['failed']
+            skipped += result['skipped']
+            adjusted_operations = []
+            queued_payload_bytes = 0
+
+        def queue_operation(operation) -> None:
+            nonlocal queued_payload_bytes
+            payload = operation[3]
+            payload_size = len(payload) if payload is not None else 0
+            if adjusted_operations and (
+                len(adjusted_operations) >= MAX_PIPELINE_KEYS
+                or queued_payload_bytes + payload_size > MAX_DUMP_BATCH_BYTES
+            ):
+                flush_operations()
+            adjusted_operations.append(operation)
+            queued_payload_bytes += payload_size
+            if (
+                len(adjusted_operations) >= MAX_PIPELINE_KEYS
+                or queued_payload_bytes >= MAX_DUMP_BATCH_BYTES
+            ):
+                flush_operations()
 
         def add_filtered_deletion(key) -> None:
             nonlocal skipped
@@ -515,74 +558,325 @@ class FullMigrationHandler:
                 skipped += 1
                 return
             operation_name = 'filtered_delete' if has_dynamic_filters else 'delete'
-            adjusted_operations.append((operation_name, key, None, None))
+            queue_operation((operation_name, key, None, None, False))
 
-        for index, key in enumerate(candidates):
+        capture_groups = (
+            [[key] for key in candidates]
+            if max_key_size > 0
+            else self._plan_source_capture_groups(candidates)
+        )
+        for group in capture_groups:
+            self._raise_if_cancelled()
+            try:
+                if len(group) == 1:
+                    captured_states = [
+                        capture_dump_with_preflight(
+                            self.source_client,
+                            group[0],
+                            preserve_ttl=preserve_ttl,
+                            key_types=key_types,
+                            min_ttl=min_ttl,
+                            max_key_size=max_key_size,
+                        )
+                    ]
+                else:
+                    captured_states = self._capture_dump_group(
+                        group,
+                        preserve_ttl=preserve_ttl,
+                        key_types=key_types,
+                        min_ttl=min_ttl,
+                    )
+            except Exception as error:
+                logger.error(
+                    "DUMP/PTTL批量读取失败 keys=%d: %s",
+                    len(group),
+                    error,
+                )
+                failed += len(group)
+                continue
+
+            for key, captured in zip(group, captured_states):
+                if isinstance(captured, BaseException):
+                    logger.error("DUMP/PTTL读取失败 key=%r: %s", key, captured)
+                    failed += 1
+                    continue
+                if captured is None:
+                    add_filtered_deletion(key)
+                    continue
+                queue_operation(
+                    (
+                        'restore',
+                        key,
+                        captured.expires_at_ms,
+                        captured.dump_data,
+                        captured.expiry_is_exact,
+                    )
+                )
+            if max_key_size <= 0:
+                # Do not retain one source group's payloads while the next
+                # group is being materialized.
+                flush_operations()
+
+        self._raise_if_cancelled()
+        flush_operations()
+        return {'migrated': migrated, 'failed': failed, 'skipped': skipped}
+
+    def _plan_source_capture_groups(self, keys: List[bytes]) -> List[List[bytes]]:
+        """Group source DUMPs by MEMORY USAGE without retaining their payloads."""
+        candidates = list(keys)
+        if len(candidates) <= 1:
+            return [candidates] if candidates else []
+
+        try:
+            pipe = self.source_client.pipeline(transaction=False)
+            for key in candidates:
+                pipe.execute_command('MEMORY', 'USAGE', key)
+            memory_results = _execute_pipeline_allowing_errors(pipe)
+        except Exception as error:
+            logger.warning(
+                "MEMORY USAGE批量预检失败，退回逐键捕获: %s",
+                error,
+            )
+            return [[key] for key in candidates]
+
+        if len(memory_results) != len(candidates):
+            logger.warning(
+                "MEMORY USAGE响应数量不匹配，退回逐键捕获: %d != %d",
+                len(memory_results),
+                len(candidates),
+            )
+            return [[key] for key in candidates]
+
+        groups = []
+        current_group = []
+        current_bytes = 0
+
+        def flush_group() -> None:
+            nonlocal current_group
+            nonlocal current_bytes
+            if current_group:
+                groups.append(current_group)
+                current_group = []
+                current_bytes = 0
+
+        for key, raw_size in zip(candidates, memory_results):
+            if (
+                isinstance(raw_size, BaseException)
+                or isinstance(raw_size, bool)
+                or not isinstance(raw_size, int)
+                or raw_size <= 0
+            ):
+                flush_group()
+                groups.append([key])
+                continue
+
+            if current_group and (
+                len(current_group) >= MAX_PIPELINE_KEYS
+                or current_bytes + raw_size > MAX_DUMP_BATCH_BYTES
+            ):
+                flush_group()
+            current_group.append(key)
+            current_bytes += raw_size
+            if (
+                len(current_group) >= MAX_PIPELINE_KEYS
+                or current_bytes >= MAX_DUMP_BATCH_BYTES
+            ):
+                flush_group()
+
+        flush_group()
+        return groups
+
+    def _capture_dump_group(
+        self,
+        keys: List[bytes],
+        *,
+        preserve_ttl: bool,
+        key_types: Optional[List[str]],
+        min_ttl: int,
+        _use_pexpiretime: Optional[bool] = None,
+    ):
+        """Atomically capture one pre-sized group in a single source RTT."""
+        needs_type = bool(key_types)
+        has_pexpiretime = preserve_ttl and (
+            source_supports_pexpiretime(self.source_client, keys[0])
+            if _use_pexpiretime is None
+            else _use_pexpiretime
+        )
+        pipe = self.source_client.pipeline(transaction=True)
+        retry_without_pexpiretime = False
+        try:
+            for key in keys:
+                pipe.dump(key)
+                pipe.pttl(key)
+                if has_pexpiretime:
+                    pipe.execute_command('PEXPIRETIME', key)
+                if needs_type:
+                    pipe.type(key)
+            sample_started_ns = time.monotonic_ns()
+            raw = _execute_pipeline_allowing_errors(pipe)
+        except Exception as error:
+            if has_pexpiretime and is_pexpiretime_capability_error(error):
+                cache_source_pexpiretime_support(self.source_client, False)
+                retry_without_pexpiretime = True
+            else:
+                raise
+        finally:
+            reset = getattr(pipe, 'reset', None)
+            if callable(reset):
+                try:
+                    reset()
+                except Exception:
+                    pass
+
+        if retry_without_pexpiretime:
+            return self._capture_dump_group(
+                keys,
+                preserve_ttl=preserve_ttl,
+                key_types=key_types,
+                min_ttl=min_ttl,
+                _use_pexpiretime=False,
+            )
+
+        stride = 2 + int(has_pexpiretime) + int(needs_type)
+        expected = len(keys) * stride
+        if len(raw) != expected:
+            raise RuntimeError(
+                f"source capture response count mismatch: {len(raw)} != {expected}"
+            )
+
+        if has_pexpiretime:
+            expiry_responses = [
+                raw[index * stride + 2]
+                for index in range(len(keys))
+            ]
+            expiry_error = next(
+                (
+                    value
+                    for value in expiry_responses
+                    if isinstance(value, BaseException)
+                ),
+                None,
+            )
+            if expiry_error is not None:
+                if not isinstance(expiry_error, redis.ResponseError):
+                    raise expiry_error
+                cache_source_pexpiretime_support(self.source_client, False)
+                del raw
+                return self._capture_dump_group(
+                    keys,
+                    preserve_ttl=preserve_ttl,
+                    key_types=key_types,
+                    min_ttl=min_ttl,
+                    _use_pexpiretime=False,
+                )
+
+        observed_at_ms = int(time.time() * 1000)
+        elapsed_ms = (
+            max(0, time.monotonic_ns() - sample_started_ns) + 999_999
+        ) // 1_000_000
+        captured_states = []
+        for index, key in enumerate(keys):
             base = index * stride
-            dump_data = results[base]
-            pttl = results[base + 1]
+            dump_data = raw[base]
+            pttl = raw[base + 1]
             next_index = base + 2
-            pexpiretime = results[next_index] if has_pexpiretime else None
+            pexpiretime = raw[next_index] if has_pexpiretime else None
             next_index += int(has_pexpiretime)
-            key_type = results[next_index] if needs_type else None
-            next_index += int(needs_type)
-            memory_size = results[next_index] if needs_memory else None
-            # PEXPIRETIME may be denied even after a successful capability
-            # probe; PTTL from the same EXEC remains a valid fallback.
-            responses = (dump_data, pttl, key_type, memory_size)
-            if any(isinstance(response, BaseException) for response in responses):
-                failed += 1
+            key_type = raw[next_index] if needs_type else None
+
+            responses = (dump_data, pttl, key_type)
+            error = next(
+                (
+                    response
+                    for response in responses
+                    if isinstance(response, BaseException)
+                ),
+                None,
+            )
+            if error is not None:
+                captured_states.append(error)
+                continue
+            if dump_data is None:
+                captured_states.append(None)
                 continue
             try:
-                pttl_value = int(pttl)
+                ttl_ms = int(pttl)
             except (TypeError, ValueError):
-                failed += 1
+                captured_states.append(
+                    ValueError(f"invalid PTTL response: {pttl!r}")
+                )
                 continue
-            if dump_data is None or pttl_value in (0, -2):
-                add_filtered_deletion(key)
+            if ttl_ms in (-2, 0):
+                captured_states.append(None)
                 continue
-            if pttl_value < -2:
-                failed += 1
+            if ttl_ms < -2:
+                captured_states.append(
+                    ValueError(f"invalid PTTL response: {ttl_ms}")
+                )
                 continue
 
             expires_at_ms = None
-            remaining_ttl_ms = pttl_value
-            if pttl_value > 0:
+            expiry_is_exact = False
+            remaining_ttl_ms = ttl_ms
+            if ttl_ms > 0:
+                remaining_ttl_ms = ttl_ms - elapsed_ms
+                if remaining_ttl_ms <= 0:
+                    captured_states.append(None)
+                    continue
                 try:
                     absolute_ms = int(pexpiretime)
                 except (TypeError, ValueError):
                     absolute_ms = -1
                 if preserve_ttl and absolute_ms > 0:
                     expires_at_ms = absolute_ms
-                    remaining_ttl_ms = absolute_ms - observed_at_ms
-                else:
-                    remaining_ttl_ms = pttl_value - elapsed_ms
-                    if preserve_ttl:
-                        expires_at_ms = observed_at_ms + remaining_ttl_ms
-                if remaining_ttl_ms <= 0:
-                    add_filtered_deletion(key)
-                    continue
+                    expiry_is_exact = True
+                elif preserve_ttl:
+                    expires_at_ms = observed_at_ms + remaining_ttl_ms
 
             if not source_state_in_dynamic_scope(
                 remaining_ttl_ms,
                 key_type=key_type,
-                memory_size=memory_size,
                 key_types=key_types,
                 min_ttl=min_ttl,
-                max_key_size=max_key_size,
             ):
-                add_filtered_deletion(key)
+                captured_states.append(None)
                 continue
-            adjusted_operations.append(
-                ('restore', key, expires_at_ms, dump_data)
+            captured_states.append(
+                CapturedDumpState(
+                    dump_data=dump_data,
+                    pttl_ms=ttl_ms,
+                    expires_at_ms=expires_at_ms,
+                    remaining_ttl_ms=remaining_ttl_ms,
+                    key_type=key_type,
+                    expiry_is_exact=expiry_is_exact,
+                )
             )
+        return captured_states
 
-        if not adjusted_operations:
-            return {'migrated': migrated, 'failed': failed, 'skipped': skipped}
+    def _write_dump_operations(
+        self,
+        operations,
+        *,
+        preserve_ttl: bool,
+        overwrite_existing: bool,
+        key_types: Optional[List[str]],
+        min_ttl: int,
+        max_key_size: int,
+    ) -> Dict[str, int]:
+        """Write one payload-bounded target pipeline and handle fallbacks."""
+        migrated = 0
+        failed = 0
+        skipped = 0
 
         try:
             pipe = self.target_client.pipeline(transaction=False)
-            for operation, key, expires_at_ms, dump_data in adjusted_operations:
+            for (
+                operation,
+                key,
+                expires_at_ms,
+                dump_data,
+                _expiry_is_exact,
+            ) in operations:
                 if operation == 'delete':
                     pipe.delete(key)
                 elif operation == 'filtered_delete':
@@ -612,11 +906,21 @@ class FullMigrationHandler:
             write_results = pipe.execute(raise_on_error=False)
         except Exception as e:
             logger.error("DUMP/RESTORE批量写入失败: %s", e)
-            failed += len(adjusted_operations)
+            failed += len(operations)
         else:
-            for operation, result in zip(adjusted_operations, write_results):
-                operation_name, key, _expires_at_ms, _dump_data = operation
-                if not isinstance(result, Exception):
+            for index, operation in enumerate(operations):
+                (
+                    operation_name,
+                    key,
+                    _expires_at_ms,
+                    _dump_data,
+                    _expiry_is_exact,
+                ) = operation
+                if index >= len(write_results):
+                    failed += 1
+                    continue
+                result = write_results[index]
+                if not isinstance(result, BaseException):
                     migrated += 1
                     continue
                 if (
@@ -643,6 +947,7 @@ class FullMigrationHandler:
                                 _expires_at_ms,
                                 overwrite=overwrite_existing,
                                 prefer_absttl=False,
+                                expires_at_is_exact=_expiry_is_exact,
                             )
                         except redis.ResponseError as legacy_error:
                             if not _is_restore_compatibility_error(legacy_error):
@@ -688,6 +993,7 @@ class FullMigrationHandler:
                             key_types=key_types,
                             min_ttl=min_ttl,
                             max_key_size=max_key_size,
+                            expires_at_is_exact=_expiry_is_exact,
                         )
                     except Exception as fallback_error:
                         logger.error(
@@ -706,16 +1012,16 @@ class FullMigrationHandler:
 
         return {'migrated': migrated, 'failed': failed, 'skipped': skipped}
 
-    def _scan_page(self, cursor: int, pattern: str, count: int):
+    def _scan_page(self, cursor: int, pattern: Optional[str], count: int):
         """读取一页 SCAN；持续故障在有限重试后终止迁移。"""
         last_error = None
         for attempt in range(1, self.SCAN_MAX_RETRIES + 1):
+            self._raise_if_cancelled()
             try:
-                return self.source_client.scan(
-                    cursor=cursor,
-                    match=pattern,
-                    count=count,
-                )
+                scan_args = {'cursor': cursor, 'count': count}
+                if pattern is not None:
+                    scan_args['match'] = pattern
+                return self.source_client.scan(**scan_args)
             except Exception as e:
                 last_error = e
                 if attempt < self.SCAN_MAX_RETRIES:
@@ -726,60 +1032,92 @@ class FullMigrationHandler:
                         e,
                     )
                     if self.SCAN_RETRY_DELAY > 0:
-                        time.sleep(self.SCAN_RETRY_DELAY * attempt)
+                        delay = self.SCAN_RETRY_DELAY * attempt
+                        if self.stop_event is not None:
+                            if self.stop_event.wait(delay):
+                                self._raise_if_cancelled()
+                        else:
+                            time.sleep(delay)
         raise MigrationError(
             f"SCAN连续失败 {self.SCAN_MAX_RETRIES} 次: {last_error}"
         ) from last_error
     
-    def _estimate_key_count(self, pattern: str, key_types: Optional[List[str]]) -> int:
+    def _estimate_key_count(
+        self,
+        pattern: str,
+        key_types: Optional[List[str]],
+        key_filter: Optional[KeySyncFilter] = None,
+    ) -> int:
         """估算匹配的键数量。"""
         try:
-            if pattern == "*" and not key_types:
+            self._raise_if_cancelled()
+            if pattern == "*" and not key_types and not key_filter:
                 return self.source_client.dbsize()
-            
-            # 采样估算
+
+            # SCAN MATCH only returns matching keys, so it cannot be used as
+            # the denominator of a selectivity sample. Sample the whole DB and
+            # apply all name filters locally instead.
             sample_size = 1000
             cursor = 0
-            sampled_keys = 0
-            matching_keys = 0
-            
-            while sampled_keys < sample_size:
+            sampled_keys = []
+            sampled_key_set = set()
+            completed_scan = False
+
+            while len(sampled_keys) < sample_size:
+                self._raise_if_cancelled()
                 cursor, keys = self._scan_page(
                     cursor,
-                    pattern,
-                    min(100, sample_size - sampled_keys),
+                    None,
+                    min(100, sample_size - len(sampled_keys)),
                 )
-                
-                for key in keys:
-                    sampled_keys += 1
-                    
-                    # 检查类型过滤
-                    if key_types:
-                        try:
-                            key_type = self.source_client.type(key).decode()
-                            if key_type in key_types:
-                                matching_keys += 1
-                        except Exception:
-                            pass
-                    else:
-                        matching_keys += 1
-                    
-                    if sampled_keys >= sample_size:
+
+                page_truncated = False
+                for key_index, key in enumerate(keys):
+                    if key in sampled_key_set:
+                        continue
+                    sampled_key_set.add(key)
+                    sampled_keys.append(key)
+                    if len(sampled_keys) >= sample_size:
+                        page_truncated = key_index + 1 < len(keys)
                         break
-                
-                if sampled_keys >= sample_size:
+
+                if len(sampled_keys) >= sample_size:
+                    completed_scan = cursor == 0 and not page_truncated
                     break
                 if cursor == 0:
+                    completed_scan = True
                     break
-            
-            if sampled_keys == 0:
+
+            if not sampled_keys:
                 return 0
-            
+
+            matching_keys = [
+                key
+                for key in sampled_keys
+                if redis_glob_match(key, pattern)
+            ]
+            if key_filter and matching_keys:
+                matching_keys = key_filter.filter_batch(
+                    self.source_client,
+                    matching_keys,
+                )
+            if key_types and matching_keys:
+                matching_keys = self._filter_keys_by_types(
+                    matching_keys,
+                    key_types,
+                    MAX_PIPELINE_KEYS,
+                )
+
+            if completed_scan:
+                exact_count = len(matching_keys)
+                logger.info("精确匹配键数: %s", exact_count)
+                return exact_count
+
             # 基于采样估算总数
             total_keys = self.source_client.dbsize()
-            match_ratio = matching_keys / sampled_keys
+            match_ratio = len(matching_keys) / len(sampled_keys)
             estimated_count = int(total_keys * match_ratio)
-            
+
             logger.info(f"估算匹配键数: {estimated_count}")
             return estimated_count
             

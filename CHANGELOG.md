@@ -7,6 +7,22 @@ All notable changes to this project will be documented in this file.
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### Fixed
+
+- 修复 PSYNC 并行分发在无活动目标、目标恢复、写入超时和服务停止时的确认与连接生命周期问题。
+- 修复键大小过滤在 DUMP 后才执行的内存放大，并对源捕获和目标 RESTORE 管道实施负载上限。
+- 修复 SCAN 估算、截断页精度、默认验证强度、TTL 检测与连续任务重启竞态。
+- 修复 Web 请求阻塞停机、无界请求线程、外部监听缺少访问约束，以及状态页忽略复制链路异常的问题。
+- 修复复制线程异常结束但进程以成功状态退出时，systemd 示例不会自动拉起服务的问题。
+
+### Changed
+
+- `verify_mode` 默认值调整为 `full`；三处 `scan_count` 配置的硬上限统一为 `100000`。
+- systemd 示例改用专用账号、固定配置路径、journald 和有限权限。
+- 新增 Python 3.7、3.8、3.9 和 3.12 的 GitHub Actions 测试矩阵，测试警告按错误处理。
+
 ## [1.0.0] - 2025-01-03
 
 ### ✨ 新增 / Added
@@ -79,7 +95,7 @@ All notable changes to this project will be documented in this file.
 - [ ] 更多的同步策略
 - [ ] 性能基准测试
 - [ ] 单元测试覆盖
-- [ ] CI/CD 集成
+- [x] Python 3.7-3.12 测试 CI
 - [ ] 多语言文档（英文）
 - [ ] 监控指标导出（Prometheus）
 - [ ] 数据压缩传输
@@ -113,4 +129,3 @@ All notable changes to this project will be documented in this file.
 ---
 
 **感谢所有贡献者！** / **Thanks to all contributors!**
-

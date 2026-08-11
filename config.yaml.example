@@ -60,11 +60,12 @@ sync:
     # sync 是兼容别名；客户端不能直接装载 RDB，实际同样走 SCAN+DUMP/RESTORE
     strategy: "scan"         # 策略: scan, sync(兼容别名), dump_restore
     batch_size: 1000         # 批处理大小（每批处理的键数）
-    scan_count: 10000        # SCAN命令的COUNT参数（每次SCAN返回的键数，建议5000-20000）
+    scan_count: 10000        # SCAN COUNT，建议5000-20000，硬上限100000
     preserve_ttl: true       # 保持TTL
     clear_target: false      # 是否清空目标数据库
     overwrite_existing: true # 覆盖目标端同名键，镜像同步建议保持 true
     verify_migration: true   # 是否验证迁移结果
+    verify_mode: "full"      # full校验值和TTL；fast仅校验存在性和类型
     key_pattern: "*"         # 键模式过滤
     key_types: null          # 键类型过滤，null表示所有类型
     
@@ -79,6 +80,10 @@ sync:
     key_types: null          # 键类型过滤
     # PSYNC 实时复制：必须为 0；按内容去重会误丢合法重复写
     command_dedup_window: 0
+    # 单个目标的 Redis 命令硬截止时间；超时断开该连接，其他目标继续同步
+    target_command_timeout: 5
+    # 空闲实时写连接的回收时间，避免长期保留 CLOSE-WAIT 文件描述符
+    target_connection_idle_timeout: 60
     # FULLRESYNC 对齐期间尚未消费的复制流缓存总上限（内存+磁盘，默认1GB）
     capture_max_size: 1073741824
     
@@ -119,7 +124,7 @@ service:
 
     # Pipeline批量操作配置（性能优化核心）
     pipeline_batch_size: 100  # Pipeline批量大小（每批处理的键数，建议50-200）
-    scan_count: 10000       # SCAN命令的COUNT参数（建议5000-20000）
+    scan_count: 10000       # SCAN COUNT，建议5000-20000，硬上限100000
     
   # 重试配置（跨境传输优化）
   retry:
@@ -177,6 +182,7 @@ security:
     key: null
 
 # Web管理界面配置
+# 内置服务最多并发处理32个请求；远程入口请由反向代理执行连接与速率限制
 web_ui:
   enabled: true             # 是否启用Web界面
   host: "127.0.0.1"        # 默认仅本机；远程访问时显式配置认证和允许网段

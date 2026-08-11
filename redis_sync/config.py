@@ -4,6 +4,7 @@ Redis Sync工具的配置管理。
 处理从文件、环境变量和命令行参数加载配置。
 """
 
+import ipaddress
 import os
 import socket
 import yaml
@@ -18,6 +19,8 @@ from .exceptions import ConfigurationError
 from .redis_protocol import MAX_REPLICATION_BUFFER_SIZE
 
 logger = logging.getLogger(__name__)
+
+MAX_SCAN_COUNT = 100_000
 
 
 @dataclass
@@ -230,12 +233,18 @@ def _validate_migration_section(values: Dict[str, Any]) -> None:
         )
     values['strategy'] = strategy
 
-    for field_name in ('batch_size', 'scan_count', 'replication_timeout', 'max_retries'):
+    for field_name in ('batch_size', 'replication_timeout', 'max_retries'):
         values[field_name] = _validate_integer(
             f'migration.{field_name}',
             values.get(field_name, getattr(defaults, field_name)),
             minimum=1,
         )
+    values['scan_count'] = _validate_integer(
+        'migration.scan_count',
+        values.get('scan_count', defaults.scan_count),
+        minimum=1,
+        maximum=MAX_SCAN_COUNT,
+    )
     values['replication_port'] = _validate_integer(
         'migration.replication_port',
         values.get('replication_port', defaults.replication_port),
@@ -877,9 +886,12 @@ def load_and_validate_service_config(config_path: str) -> Dict[str, Any]:
         )
     full_sync["strategy"] = full_strategy
     _key_scope("sync.full_sync", full_sync)
-    for field, default in (("batch_size", 1000), ("scan_count", 10000)):
+    for field, default, maximum in (
+        ("batch_size", 1000, 10**9),
+        ("scan_count", 10000, MAX_SCAN_COUNT),
+    ):
         full_sync[field] = _integer(
-            f"sync.full_sync.{field}", full_sync.get(field, default), 1, 10**9
+            f"sync.full_sync.{field}", full_sync.get(field, default), 1, maximum
         )
     for field, default in (
         ("preserve_ttl", True),
@@ -890,7 +902,7 @@ def load_and_validate_service_config(config_path: str) -> Dict[str, Any]:
         full_sync[field] = _boolean(
             f"sync.full_sync.{field}", full_sync.get(field, default)
         )
-    verify_mode = str(full_sync.get("verify_mode", "fast")).lower()
+    verify_mode = str(full_sync.get("verify_mode", "full")).lower()
     if verify_mode not in {"fast", "full"}:
         raise ConfigurationError(
             "sync.full_sync.verify_mode 必须是 fast 或 full"
@@ -911,8 +923,8 @@ def load_and_validate_service_config(config_path: str) -> Dict[str, Any]:
             "enabled", "method", "change_detection_method", "apply_mode",
             "interval", "max_changes_per_sync", "key_pattern", "key_types",
             "command_dedup_window", "target_command_timeout", "buffer_size",
-            "capture_max_size", "listening_port", "ack_interval", "skip_commands",
-            "include_commands", "filters",
+            "target_connection_idle_timeout", "capture_max_size", "listening_port",
+            "ack_interval", "skip_commands", "include_commands", "filters",
         },
     )
     method = str(
@@ -986,6 +998,12 @@ def load_and_validate_service_config(config_path: str) -> Dict[str, Any]:
     incremental["target_command_timeout"] = _number(
         "sync.incremental_sync.target_command_timeout",
         incremental.get("target_command_timeout", 5),
+        0.001,
+        10**9,
+    )
+    incremental["target_connection_idle_timeout"] = _number(
+        "sync.incremental_sync.target_connection_idle_timeout",
+        incremental.get("target_connection_idle_timeout", 60),
         0.001,
         10**9,
     )
@@ -1148,7 +1166,10 @@ def load_and_validate_service_config(config_path: str) -> Dict[str, Any]:
         1024,
     )
     performance["scan_count"] = _integer(
-        "service.performance.scan_count", performance["scan_count"], 1, 10**9
+        "service.performance.scan_count",
+        performance["scan_count"],
+        1,
+        MAX_SCAN_COUNT,
     )
     performance["pipeline_batch_size"] = _integer(
         "service.performance.pipeline_batch_size",
@@ -1255,10 +1276,40 @@ def load_and_validate_service_config(config_path: str) -> Dict[str, Any]:
     api_key = security.get("api_key")
     if api_key is not None and not isinstance(api_key, str):
         raise ConfigurationError("security.api_key 必须是字符串或 null")
-    if security["auth_enabled"] and not api_key:
+    if security["auth_enabled"] and (not api_key or not api_key.strip()):
         raise ConfigurationError(
             "security.auth_enabled=true 时 security.api_key 必须是非空字符串"
         )
+
+    normalized_host = host.strip().lower().rstrip(".")
+    try:
+        bind_address = ipaddress.ip_address(normalized_host.split("%", 1)[0])
+        loopback_bind = bind_address.is_loopback
+    except ValueError:
+        loopback_bind = normalized_host == "localhost"
+
+    if web_ui["enabled"] and not loopback_bind and not security["auth_enabled"]:
+        allowed_ips = security.get("allowed_ips")
+        if not allowed_ips:
+            raise ConfigurationError(
+                "Web UI 监听非本机地址时必须启用 API key 认证，"
+                "或将 security.allowed_ips 限定为非空 loopback 网段列表"
+            )
+        for allowed_ip in allowed_ips:
+            allowed_text = allowed_ip.strip()
+            try:
+                network = ipaddress.ip_network(allowed_text, strict=False)
+            except ValueError as exc:
+                raise ConfigurationError(
+                    "匿名外部 Web UI 的 security.allowed_ips 只能包含有效的 "
+                    "loopback IP/CIDR"
+                ) from exc
+            if allowed_text == "*" or not network.is_loopback:
+                raise ConfigurationError(
+                    "匿名外部 Web UI 的 security.allowed_ips 只能包含 "
+                    "loopback IP/CIDR"
+                )
+
     encryption = security.setdefault("encryption", {})
     encryption = _mapping("security.encryption", encryption)
     _known_fields("security.encryption", encryption, {"enabled", "key"})

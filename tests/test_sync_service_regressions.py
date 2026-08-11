@@ -1,6 +1,8 @@
 import hashlib
 import logging
 import sys
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -50,7 +52,11 @@ class FakeSourcePipeline:
             elif command == "pexpiretime":
                 results.append(value[2] if value and len(value) > 2 else -1)
             elif command == "memory":
-                results.append(value[4] if value and len(value) > 4 else None)
+                results.append(
+                    value[4]
+                    if value and len(value) > 4
+                    else len(value[0]) if value and value[0] is not None else None
+                )
             else:
                 results.append(
                     value[3]
@@ -220,6 +226,14 @@ def make_service(source, previous=None):
     return service
 
 
+def test_service_sync_config_falls_back_to_full_verification():
+    service = make_service(FakeSource({}))
+    service.config["sync"]["mode"] = "full"
+    service.config["sync"]["full_sync"] = {}
+
+    assert service._create_sync_config().verify_mode == "full"
+
+
 def make_realtime_alignment_service(source, target, bootstrap_snapshot):
     service = make_service(source)
     service.config["sync"].update(
@@ -241,6 +255,42 @@ def make_realtime_alignment_service(source, target, bootstrap_snapshot):
     service._perform_full_sync = MagicMock(return_value=True)
     service._deactivate_realtime_target = MagicMock()
     return service
+
+
+def test_fullresync_snapshot_stop_does_not_wait_for_alignment_executor():
+    service = make_realtime_alignment_service(
+        FakeSource({}), RecordingTarget(), None
+    )
+    service.shutdown_event = threading.Event()
+    alignment_started = threading.Event()
+    allow_alignment_exit = threading.Event()
+    results = []
+
+    def blocked_alignment(*_args, **_kwargs):
+        alignment_started.set()
+        allow_alignment_exit.wait(1)
+        return False
+
+    service._align_realtime_target = blocked_alignment
+    callback = threading.Thread(
+        target=lambda: results.append(
+            service._apply_replication_snapshot(b"snapshot")
+        )
+    )
+    callback.start()
+    assert alignment_started.wait(1)
+
+    started = time.monotonic()
+    service.shutdown_event.set()
+    callback.join(timeout=0.5)
+
+    assert time.monotonic() - started < 0.5
+    assert not callback.is_alive()
+    assert results == [False]
+    assert service._wait_for_alignment_futures(0) is False
+
+    allow_alignment_exit.set()
+    assert service._wait_for_alignment_futures(1) is True
 
 
 def test_snapshot_detects_binary_key_update_and_deletion():
@@ -273,8 +323,29 @@ def test_snapshot_uses_configured_bounded_dump_batches():
     snapshot = service._build_source_snapshot()
 
     assert set(snapshot) == {b"one", b"two", b"three"}
-    assert source.pipeline_transactions == [True, True]
-    assert [len(operations) for operations in source.pipeline_operations] == [6, 3]
+    assert source.pipeline_transactions == [False, False, True, True]
+    assert [len(operations) for operations in source.pipeline_operations] == [2, 1, 6, 3]
+
+
+def test_snapshot_dump_groups_honor_payload_budget(monkeypatch):
+    source = FakeSource(
+        {
+            b"first": (b"123456", -1, -1, b"string", 6),
+            b"second": (b"abcdef", -1, -1, b"string", 6),
+        }
+    )
+    service = make_service(source)
+    monkeypatch.setattr(sync_service_module, "MAX_DUMP_BATCH_BYTES", 10)
+
+    snapshot = service._build_source_snapshot()
+
+    assert set(snapshot) == {b"first", b"second"}
+    dump_batches = [
+        [operation for operation in batch if operation[0] == "dump"]
+        for batch in source.pipeline_operations
+        if any(operation[0] == "dump" for operation in batch)
+    ]
+    assert [len(batch) for batch in dump_batches] == [1, 1]
 
 
 def test_pipeline_batch_size_is_capped_for_programmatic_config():
@@ -303,8 +374,16 @@ def test_snapshot_type_lookups_use_configured_pipeline_batch_size():
     snapshot = service._build_source_snapshot()
 
     assert len(snapshot) == 5
-    assert source.pipeline_transactions == [False, False, False, True, True, True]
-    assert [len(batch) for batch in source.pipeline_operations] == [2, 2, 1, 6, 6, 3]
+    assert source.pipeline_transactions == [
+        False, False, False,
+        False, False, False,
+        True, True, True,
+    ]
+    assert [len(batch) for batch in source.pipeline_operations] == [
+        2, 2, 1,
+        2, 2, 1,
+        6, 6, 3,
+    ]
 
 
 def test_type_pipeline_error_aborts_snapshot_without_inventing_deletions():
@@ -381,6 +460,18 @@ def test_redis6_snapshot_drops_key_that_expires_during_pipeline_delay(monkeypatc
             )
         }
     )
+    service = make_service(source)
+    monotonic_clock = iter((0, 1_000_000_000))
+    monkeypatch.setattr(
+        sync_service_module.time, "monotonic_ns", lambda: next(monotonic_clock)
+    )
+    monkeypatch.setattr(sync_service_module.time, "time", lambda: 100.0)
+
+    assert service._build_source_snapshot() == {}
+
+
+def test_redis7_snapshot_uses_pttl_for_liveness(monkeypatch):
+    source = FakeSource({b"key": (b"dump", 500, 999_999)})
     service = make_service(source)
     monotonic_clock = iter((0, 1_000_000_000))
     monkeypatch.setattr(
@@ -1056,6 +1147,66 @@ def test_delivery_reuses_one_captured_payload_and_commits_its_fingerprint():
     assert next_changes.upserts == [b"key"]
 
 
+def test_delivery_capture_max_size_preflight_never_dumps_oversized_key():
+    class OversizedPipeline:
+        def __init__(self):
+            self.dump_calls = 0
+
+        def watch(self, _key):
+            return self
+
+        def pttl(self, _key):
+            return -1
+
+        def execute_command(self, command, subcommand, _key):
+            assert (command, subcommand) == ("MEMORY", "USAGE")
+            return 101
+
+        def multi(self):
+            return self
+
+        def dump(self, _key):
+            self.dump_calls += 1
+            return self
+
+        def execute(self, **_kwargs):
+            raise AssertionError("oversized key reached DUMP transaction")
+
+        def reset(self):
+            return None
+
+    source = MagicMock()
+    source.execute_command.side_effect = redis.ResponseError("unknown command")
+    watched = OversizedPipeline()
+    source.pipeline.return_value = watched
+    service = make_service(source)
+    service._sync_key_filter = KeySyncFilter(max_key_size=100)
+
+    captured, invalid = service._capture_source_states(
+        source,
+        [b"oversized"],
+    )
+
+    assert captured == {}
+    assert invalid == [b"oversized"]
+    assert watched.dump_calls == 0
+
+
+def test_delivery_capture_uses_pttl_for_liveness(monkeypatch):
+    source = FakeSource({b"key": (b"dump", 500, 999_999)})
+    service = make_service(source)
+    monotonic_clock = iter((0, 1_000_000_000))
+    monkeypatch.setattr(
+        sync_service_module.time, "monotonic_ns", lambda: next(monotonic_clock)
+    )
+    monkeypatch.setattr(sync_service_module.time, "time", lambda: 100.0)
+
+    captured, invalid = service._capture_source_states(source, [b"key"])
+
+    assert captured == {}
+    assert invalid == [b"key"]
+
+
 @pytest.mark.parametrize(
     ("source_state", "key_types", "key_filter"),
     [
@@ -1633,23 +1784,20 @@ def test_redis6_target_write_deletes_key_expired_during_source_read(monkeypatch)
 
 
 @pytest.mark.parametrize(
-    ("target_time", "expected"),
+    "target_time",
     [
-        (
-            101.0,
-                [("restore", b"key", 102_500, b"dump", True, True)],
-        ),
-        (103.0, [("delete", b"key")]),
+        101.0,
+        103.0,
     ],
-    ids=["remaining-absolute-ttl", "expired-before-target-write"],
+    ids=["local-clock-before-deadline", "local-clock-after-deadline"],
 )
-def test_target_write_uses_remaining_absolute_ttl_or_deletes(
-    monkeypatch, target_time, expected
+def test_target_write_does_not_use_process_clock_to_predelete(
+    monkeypatch, target_time
 ):
     clock = iter((100.0, target_time, target_time))
     monkeypatch.setattr(sync_service_module.time, "time", lambda: next(clock))
-    # PEXPIRETIME is already absolute; source pipeline RTT must not reduce it.
-    monotonic_clock = iter((0, 10_000_000_000))
+    # PTTL decides liveness; PEXPIRETIME remains the exact target deadline.
+    monotonic_clock = iter((0, 100_000_000))
     monkeypatch.setattr(
         sync_service_module.time, "monotonic_ns", lambda: next(monotonic_clock)
     )
@@ -1667,7 +1815,53 @@ def test_target_write_uses_remaining_absolute_ttl_or_deletes(
     }
 
     assert service._sync_keys_to_target("target", [b"key"]) is True
-    assert target.operations == expected
+    assert target.operations == [
+        ("restore", b"key", 102_500, b"dump", True, True)
+    ]
+
+
+def test_scan_sync_old_target_receives_exact_expiry_provenance(monkeypatch):
+    class LegacyPipeline(RecordingTargetPipeline):
+        def execute(self, **_kwargs):
+            self.target.pipeline_operations.append(list(self.operations))
+            self.target.operations.extend(self.operations)
+            return [redis.ResponseError("ERR syntax error")]
+
+    class LegacyTarget(RecordingTarget):
+        def pipeline(self, transaction=False):
+            assert transaction is False
+            return LegacyPipeline(self)
+
+    source = FakeSource({b"key": (b"dump", 2500, 102_500)})
+    target = LegacyTarget()
+    service = make_service(source)
+    service.stats = {"target": SyncStats()}
+    service.orchestrators = {
+        "target": SimpleNamespace(
+            connection_manager=SimpleNamespace(
+                source_client=source,
+                target_client=target,
+            )
+        )
+    }
+    legacy_restore = MagicMock(return_value=True)
+    monkeypatch.setattr(
+        sync_service_module,
+        "restore_dump_with_deadline",
+        legacy_restore,
+    )
+    monkeypatch.setattr(sync_service_module.time, "monotonic_ns", lambda: 0)
+
+    assert service._sync_keys_to_target("target", [b"key"]) is True
+    legacy_restore.assert_called_once_with(
+        target,
+        b"key",
+        b"dump",
+        102_500,
+        overwrite=True,
+        prefer_absttl=False,
+        expires_at_is_exact=True,
+    )
 
 
 def test_target_pipeline_delay_does_not_extend_absolute_deadline(monkeypatch):

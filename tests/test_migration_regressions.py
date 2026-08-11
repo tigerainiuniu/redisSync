@@ -1,3 +1,4 @@
+import threading
 import time
 from unittest.mock import MagicMock, call, patch
 
@@ -64,6 +65,49 @@ def test_full_migration_does_not_clear_target_by_default():
     target.flushdb.assert_not_called()
 
 
+def test_full_migration_stops_before_next_batch_when_cancelled():
+    stop_event = threading.Event()
+    source = MagicMock()
+    source.dbsize.return_value = 2
+    source.scan.return_value = (0, [b"first", b"second"])
+    handler = FullMigrationHandler(source, MagicMock(), stop_event=stop_event)
+    migrated_batches = []
+
+    def migrate_batch(keys, *_args):
+        migrated_batches.append(list(keys))
+        stop_event.set()
+        return {"migrated": len(keys), "failed": 0, "skipped": 0}
+
+    handler._migrate_key_batch = migrate_batch
+
+    result = handler.perform_full_migration(batch_size=1)
+
+    assert result["success"] is False
+    assert "取消" in result["error"]
+    assert migrated_batches == [[b"first"]]
+
+
+def test_full_migration_scan_retry_wait_is_interruptible():
+    stop_event = threading.Event()
+    source = MagicMock()
+
+    def fail_scan(**_kwargs):
+        stop_event.set()
+        raise redis.ConnectionError("scan blocked")
+
+    source.scan.side_effect = fail_scan
+    handler = FullMigrationHandler(source, MagicMock(), stop_event=stop_event)
+    handler.SCAN_RETRY_DELAY = 60
+
+    started = time.monotonic()
+    result = handler.perform_full_migration(key_pattern="managed:*")
+
+    assert time.monotonic() - started < 0.2
+    assert result["success"] is False
+    assert "取消" in result["error"]
+    assert source.scan.call_count == 1
+
+
 def test_sync_strategy_uses_scan_fallback_without_opening_replication_stream():
     source = MagicMock()
     source.dbsize.return_value = 0
@@ -88,6 +132,57 @@ def test_estimate_key_count_stops_after_empty_scan_cycle():
 
     assert handler._estimate_key_count("missing:*", None) == 0
     assert source.scan.call_count == 1
+
+
+def test_estimate_key_count_samples_full_db_before_applying_pattern():
+    source = MagicMock()
+
+    def scan(**kwargs):
+        if "match" in kwargs:
+            return 0, [b"tenant:1"]
+        return 0, [b"tenant:1", b"other:1"]
+
+    source.scan.side_effect = scan
+    source.dbsize.return_value = 1000
+    handler = FullMigrationHandler(source, MagicMock())
+
+    assert handler._estimate_key_count("tenant:*", None) == 1
+    assert source.scan.call_args.kwargs == {"cursor": 0, "count": 100}
+
+
+def test_estimate_key_count_applies_name_filter_to_completed_sample():
+    source = MagicMock()
+    source.scan.return_value = (
+        0,
+        [b"tenant:public", b"tenant:private", b"other:public"],
+    )
+    handler = FullMigrationHandler(source, MagicMock())
+    key_filter = KeySyncFilter(exclude_patterns=[b"*:private"])
+
+    assert handler._estimate_key_count("tenant:*", None, key_filter) == 1
+
+
+def test_estimate_key_count_applies_dynamic_filters_to_sample():
+    source = MagicMock()
+    source.scan.return_value = (0, [b"small", b"large"])
+    source.pipeline.return_value = _pipeline([-1, 50, -1, 150])
+    handler = FullMigrationHandler(source, MagicMock())
+    key_filter = KeySyncFilter(max_key_size=100)
+
+    assert handler._estimate_key_count("*", None, key_filter) == 1
+
+
+def test_estimate_key_count_does_not_treat_truncated_last_page_as_exact():
+    source = MagicMock()
+    source.scan.return_value = (
+        0,
+        [f"tenant:{index}".encode() for index in range(1000)] + [b"other"],
+    )
+    source.dbsize.return_value = 2000
+    handler = FullMigrationHandler(source, MagicMock())
+
+    assert handler._estimate_key_count("tenant:*", None) == 2000
+    source.dbsize.assert_called_once_with()
 
 
 def test_full_migration_stops_after_scan_retry_limit():
@@ -321,6 +416,7 @@ def test_full_batch_uses_single_key_fallback_for_restore_compatibility(monkeypat
         key_types=None,
         min_ttl=0,
         max_key_size=0,
+        expires_at_is_exact=False,
     )
 
 
@@ -419,7 +515,7 @@ def test_full_batch_uses_exact_source_pexpiretime(monkeypatch):
     target = MagicMock()
     write_pipe = _pipeline([b"OK"])
     target.pipeline.return_value = write_pipe
-    monotonic_values = iter([0, 10_000_000_000])
+    monotonic_values = iter([0, 100_000_000])
     monkeypatch.setattr(
         full_migration_module.time,
         "monotonic_ns",
@@ -440,13 +536,14 @@ def test_full_batch_uses_exact_source_pexpiretime(monkeypatch):
 def test_full_batch_pexpiretime_error_falls_back_to_pttl(monkeypatch):
     source = MagicMock()
     source.execute_command.return_value = 102_500
-    source.pipeline.return_value = _pipeline(
-        [b"dump", 250, redis.ResponseError("NOPERM PEXPIRETIME")]
-    )
+    source.pipeline.side_effect = [
+        _pipeline([b"dump", 250, redis.ResponseError("NOPERM PEXPIRETIME")]),
+        _pipeline([b"dump", 250]),
+    ]
     target = MagicMock()
     write_pipe = _pipeline([b"OK"])
     target.pipeline.return_value = write_pipe
-    monotonic_values = iter([0, 100_000_000])
+    monotonic_values = iter([0, 0, 100_000_000])
     monkeypatch.setattr(
         full_migration_module.time,
         "monotonic_ns",
@@ -492,6 +589,43 @@ def test_full_batch_old_target_reuses_captured_dump_and_deadline(monkeypatch):
     source_fallback.assert_not_called()
 
 
+def test_full_batch_old_target_receives_exact_expiry_provenance(monkeypatch):
+    source = MagicMock()
+    source.execute_command.return_value = 102_500
+    source.pipeline.return_value = _pipeline([b"dump", 2500, 102_500])
+    target = MagicMock()
+    target.pipeline.return_value = _pipeline(
+        [redis.ResponseError("ERR syntax error")]
+    )
+    legacy_restore = MagicMock(return_value=True)
+    monkeypatch.setattr(
+        full_migration_module,
+        "restore_dump_with_deadline",
+        legacy_restore,
+    )
+    monotonic_values = iter([0, 100_000_000])
+    monkeypatch.setattr(
+        full_migration_module.time,
+        "monotonic_ns",
+        lambda: next(monotonic_values),
+    )
+
+    result = FullMigrationHandler(source, target)._dump_restore_batch(
+        [b"key"], preserve_ttl=True, overwrite_existing=True
+    )
+
+    assert result == {"migrated": 1, "failed": 0, "skipped": 0}
+    legacy_restore.assert_called_once_with(
+        target,
+        b"key",
+        b"dump",
+        102_500,
+        overwrite=True,
+        prefer_absttl=False,
+        expires_at_is_exact=True,
+    )
+
+
 @pytest.mark.parametrize("pttl", [0, -2])
 def test_key_sync_deletes_target_when_key_expires_between_dump_and_pttl(pttl):
     source = MagicMock()
@@ -525,13 +659,13 @@ def test_key_sync_deducts_elapsed_time_from_pttl(monkeypatch):
     )
 
 
-def test_key_sync_uses_source_pexpiretime_without_rtt_deduction(monkeypatch):
+def test_key_sync_uses_exact_source_deadline_while_pttl_is_alive(monkeypatch):
     source = MagicMock()
     source.exists.return_value = True
     source.execute_command.return_value = 102_500
     source.pipeline.return_value = _pipeline([b"dump", 2500, 102_500])
     target = MagicMock()
-    monotonic_values = iter([0, 10_000_000_000])
+    monotonic_values = iter([0, 100_000_000])
     monkeypatch.setattr(
         key_sync_module.time,
         "monotonic_ns",
@@ -621,7 +755,7 @@ def test_key_sync_missing_temp_at_pexpireat_after_deadline_deletes_old_target(
     target.restore.side_effect = [redis.ResponseError("ERR syntax error"), b"OK"]
     target.pexpireat.return_value = False
     monkeypatch.setattr(key_sync_module.time, "monotonic_ns", lambda: 0)
-    wall_clock = iter([100.0, 100.0, 101.0])
+    wall_clock = iter([100.0, 101.0])
     monkeypatch.setattr(key_sync_module.time, "time", lambda: next(wall_clock))
 
     assert sync_key_with_dump_restore(source, target, b"key") is True
@@ -714,7 +848,7 @@ def test_key_sync_type_fallback_missing_temp_after_deadline_deletes_old_target(
     )
     target.pexpireat.return_value = False
     monkeypatch.setattr(key_sync_module.time, "monotonic_ns", lambda: 0)
-    wall_clock = iter([100.0, 100.0, 100.0, 100.0, 100.0, 101.0])
+    wall_clock = iter([100.0, 100.0, 101.0])
     monkeypatch.setattr(key_sync_module.time, "time", lambda: next(wall_clock))
 
     assert sync_key_with_dump_restore(source, target, b"key") is True
@@ -1056,6 +1190,28 @@ def test_incremental_comparison_scan_duplicates_do_not_consume_change_budget():
     assert changed == [b"duplicate", b"later"]
 
 
+def test_incremental_comparison_only_retains_selected_keys_across_pages():
+    source = MagicMock()
+    source.scan.side_effect = [
+        (1, [b"changes-later"]),
+        (0, [b"changes-later", b"later"]),
+    ]
+    handler = IncrementalMigrationHandler(source, MagicMock(), scan_count=4)
+    comparisons = {b"changes-later": 0}
+
+    def is_different(key):
+        if key == b"changes-later":
+            comparisons[key] += 1
+            return comparisons[key] == 2, "changed on second page"
+        return True, "different"
+
+    handler._is_key_different = is_different
+
+    changed = handler._detect_changes_by_comparison("*", None, 2, set())
+
+    assert changed == [b"changes-later", b"later"]
+
+
 def test_incremental_target_scan_duplicates_do_not_consume_deletion_budget():
     source = MagicMock()
     source.pipeline.side_effect = [_pipeline([0]), _pipeline([0])]
@@ -1071,6 +1227,24 @@ def test_incremental_target_scan_duplicates_do_not_consume_deletion_budget():
     assert deleted == [b"duplicate", b"later"]
 
 
+def test_incremental_target_scan_only_retains_selected_keys_across_pages():
+    source = MagicMock()
+    source.pipeline.side_effect = [
+        _pipeline([1]),
+        _pipeline([0, 0]),
+    ]
+    target = MagicMock()
+    target.scan.side_effect = [
+        (1, [b"deleted-later"]),
+        (0, [b"deleted-later", b"later"]),
+    ]
+    handler = IncrementalMigrationHandler(source, target, scan_count=2)
+
+    deleted = handler._detect_target_only_keys("*", None, 2, set())
+
+    assert deleted == [b"deleted-later", b"later"]
+
+
 def test_incremental_zero_change_limit_returns_compatible_empty_tuple():
     handler = IncrementalMigrationHandler(MagicMock(), MagicMock())
     handler._detect_changes_by_comparison = MagicMock(return_value=[])
@@ -1082,6 +1256,89 @@ def test_incremental_zero_change_limit_returns_compatible_empty_tuple():
 
     assert detected == ([], set())
     handler._detect_target_only_keys.assert_not_called()
+
+
+def test_incremental_stop_timeout_keeps_old_worker_and_stop_event():
+    source = MagicMock()
+    handler = IncrementalMigrationHandler(source, MagicMock())
+    handler.THREAD_JOIN_TIMEOUT = 0.01
+    entered = threading.Event()
+    release = threading.Event()
+    worker = None
+
+    def blocked_sync(*_args, **_kwargs):
+        entered.set()
+        release.wait(timeout=2)
+        return {"success": True}
+
+    handler.perform_incremental_sync = blocked_sync
+    try:
+        assert handler.start_incremental_sync(sync_interval=60) is True
+        assert entered.wait(timeout=1)
+        worker = handler.monitor_thread
+
+        handler.stop_incremental_sync()
+
+        assert worker is not None and worker.is_alive()
+        assert handler.is_monitoring is True
+        assert handler.stop_event.is_set()
+        assert handler.start_incremental_sync(sync_interval=60) is False
+        assert handler.monitor_thread is worker
+        assert handler.stop_event.is_set()
+    finally:
+        release.set()
+        if worker is not None:
+            worker.join(timeout=1)
+
+    assert worker is not None and not worker.is_alive()
+    assert handler.is_monitoring is False
+    assert handler.monitor_thread is None
+
+
+def test_incremental_max_key_size_preflight_skips_dump_for_oversized_key():
+    class OversizedPipeline:
+        def __init__(self):
+            self.dump_calls = 0
+            self.reset_calls = 0
+
+        def watch(self, _key):
+            return self
+
+        def pttl(self, _key):
+            return -1
+
+        def execute_command(self, command, subcommand, _key):
+            assert (command, subcommand) == ("MEMORY", "USAGE")
+            return 101
+
+        def multi(self):
+            return self
+
+        def dump(self, _key):
+            self.dump_calls += 1
+            return self
+
+        def execute(self, **_kwargs):
+            raise AssertionError("oversized key reached DUMP transaction")
+
+        def reset(self):
+            self.reset_calls += 1
+
+    source = MagicMock()
+    source.execute_command.side_effect = redis.ResponseError("unknown command")
+    watched = OversizedPipeline()
+    source.pipeline.return_value = watched
+    handler = IncrementalMigrationHandler(source, MagicMock())
+
+    captured = handler._capture_scoped_source_key(
+        b"oversized",
+        None,
+        KeySyncFilter(max_key_size=100),
+    )
+
+    assert captured == (False, None, None, False)
+    assert watched.dump_calls == 0
+    assert watched.reset_calls == 1
 
 
 @pytest.mark.parametrize(
@@ -1099,11 +1356,18 @@ def test_incremental_atomic_source_capture_rejects_dynamic_filter_misses(
     source.pipeline.return_value = _pipeline(sample)
     handler = IncrementalMigrationHandler(source, MagicMock())
 
-    in_scope, dump_data, expires_at = handler._capture_scoped_source_key(
-        key, key_types, key_filter
+    in_scope, dump_data, expires_at, expiry_is_exact = (
+        handler._capture_scoped_source_key(
+            key, key_types, key_filter
+        )
     )
 
-    assert (in_scope, dump_data, expires_at) == (False, None, None)
+    assert (in_scope, dump_data, expires_at, expiry_is_exact) == (
+        False,
+        None,
+        None,
+        False,
+    )
 
 
 def test_incremental_atomic_source_capture_rechecks_name_filter():
@@ -1116,7 +1380,7 @@ def test_incremental_atomic_source_capture_rechecks_name_filter():
         b"excluded", None, key_filter
     )
 
-    assert captured == (False, None, None)
+    assert captured == (False, None, None, False)
     assert handler._sync_single_key(b"excluded", None, key_filter) is True
     source.pipeline.assert_not_called()
     target.execute_command.assert_not_called()
@@ -1128,10 +1392,13 @@ def test_incremental_atomic_capture_pexpiretime_error_falls_back_to_pttl(
 ):
     source = MagicMock()
     source.execute_command.return_value = 102_500
-    source.pipeline.return_value = _pipeline(
-        [b"dump", 250, redis.ResponseError("NOPERM PEXPIRETIME"), b"string"]
-    )
-    monotonic_values = iter([0, 100_000_000])
+    source.pipeline.side_effect = [
+        _pipeline(
+            [b"dump", 250, redis.ResponseError("NOPERM PEXPIRETIME"), b"string"]
+        ),
+        _pipeline([b"dump", 250, b"string"]),
+    ]
+    monotonic_values = iter([0, 0, 100_000_000])
     monkeypatch.setattr(
         incremental_migration_module.time,
         "monotonic_ns",
@@ -1143,7 +1410,7 @@ def test_incremental_atomic_capture_pexpiretime_error_falls_back_to_pttl(
         source, MagicMock()
     )._capture_scoped_source_key(b"key", ["string"], None)
 
-    assert captured == (True, b"dump", 100_150)
+    assert captured == (True, b"dump", 100_150, False)
 
 
 def test_incremental_upsert_moved_out_of_scope_uses_filtered_target_delete():
@@ -1205,7 +1472,14 @@ def test_incremental_filtered_upsert_repairs_scope_exit_after_restore():
             key, None, KeySyncFilter(max_key_size=100)
         ) is True
 
-    restore.assert_called_once_with(target, key, b"dump", None, overwrite=True)
+    restore.assert_called_once_with(
+        target,
+        key,
+        b"dump",
+        None,
+        overwrite=True,
+        expires_at_is_exact=False,
+    )
     assert target.execute_command.call_args.args[0] == b"EVAL"
     target.delete.assert_not_called()
 
@@ -1216,7 +1490,7 @@ def test_incremental_filtered_compatibility_fallback_keeps_captured_identity():
     target = MagicMock()
     handler = IncrementalMigrationHandler(source, target)
     handler._capture_scoped_source_key = MagicMock(
-        return_value=(True, b"captured-dump", None)
+        return_value=(True, b"captured-dump", None, False)
     )
     key_filter = KeySyncFilter(min_ttl=10, max_key_size=100)
 
@@ -1243,9 +1517,45 @@ def test_incremental_filtered_compatibility_fallback_keeps_captured_identity():
         key_types=["string"],
         min_ttl=10,
         max_key_size=100,
+        expires_at_is_exact=False,
     )
     target.set.assert_not_called()
     target.rename.assert_not_called()
+
+
+def test_incremental_filtered_legacy_fallback_receives_exact_expiry(monkeypatch):
+    key = b"exact-expiry"
+    source = MagicMock()
+    target = MagicMock()
+    handler = IncrementalMigrationHandler(source, target)
+    handler._capture_scoped_source_key = MagicMock(
+        return_value=(True, b"captured-dump", 102_500, True)
+    )
+    handler._source_key_in_scope = MagicMock(return_value=True)
+    monkeypatch.setattr(incremental_migration_module.time, "time", lambda: 999.0)
+
+    with patch(
+        "redis_sync.incremental_migration_handler.restore_dump_with_deadline",
+        side_effect=redis.ResponseError(
+            "ERR DUMP payload version or checksum are wrong"
+        ),
+    ) as restore, patch(
+        "redis_sync.incremental_migration_handler._sync_key_fallback",
+        return_value=True,
+    ) as fallback:
+        assert handler._sync_single_key(
+            key, ["string"], KeySyncFilter(min_ttl=10)
+        ) is True
+
+    restore.assert_called_once_with(
+        target,
+        key,
+        b"captured-dump",
+        102_500,
+        overwrite=True,
+        expires_at_is_exact=True,
+    )
+    assert fallback.call_args.kwargs["expires_at_is_exact"] is True
 
 
 def test_incremental_value_filter_deletion_candidate_is_deleted_not_copied():
@@ -1385,6 +1695,10 @@ class _BatchRecordingPipeline:
     def pttl(self, key):
         return self._add("pttl", key)
 
+    def execute_command(self, command, subcommand, key):
+        assert (command, subcommand) == ("MEMORY", "USAGE")
+        return self._add("memory", key)
+
     def restore(self, key, ttl, dump_data, replace=False):
         return self._add("restore", key, ttl, dump_data, replace)
 
@@ -1407,6 +1721,8 @@ class _BatchRecordingPipeline:
                 results.append(b"dump:" + key)
             elif command == "pttl":
                 results.append(-1)
+            elif command == "memory":
+                results.append(len(b"dump:" + key))
             elif command == "delete":
                 results.append(1)
             else:
@@ -1490,7 +1806,36 @@ def test_direct_full_dump_restore_batch_is_hard_capped_at_200_keys():
     assert _recorded_batch_sizes(source, "dump") == [200, 200, 5]
     assert _recorded_batch_sizes(source, "pttl") == [200, 200, 5]
     assert _recorded_batch_sizes(source, "type") == [200, 200, 5]
+    assert _recorded_batch_sizes(source, "memory") == [200, 200, 5]
     assert _recorded_batch_sizes(target, "restore") == [200, 200, 5]
+
+
+def test_full_dump_restore_flushes_target_pipeline_at_payload_budget(monkeypatch):
+    source = MagicMock()
+    source.pipeline.side_effect = [
+        _pipeline([6, 6]),
+        _pipeline([b"123456", -1]),
+        _pipeline([b"abcdef", -1]),
+    ]
+    target = MagicMock()
+    first_write = _pipeline([b"OK"])
+    second_write = _pipeline([b"OK"])
+    target.pipeline.side_effect = [first_write, second_write]
+    monkeypatch.setattr(full_migration_module, "MAX_DUMP_BATCH_BYTES", 10)
+
+    result = FullMigrationHandler(source, target)._dump_restore_batch(
+        [b"first", b"second"],
+        preserve_ttl=True,
+        overwrite_existing=True,
+    )
+
+    assert result == {"migrated": 2, "failed": 0, "skipped": 0}
+    first_write.restore.assert_called_once_with(
+        b"first", 0, b"123456", replace=True
+    )
+    second_write.restore.assert_called_once_with(
+        b"second", 0, b"abcdef", replace=True
+    )
 
 
 def test_incremental_idletime_type_and_object_pipelines_are_hard_capped():

@@ -5,6 +5,7 @@
 import logging
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Union
 
 import redis
@@ -15,10 +16,24 @@ logger = logging.getLogger(__name__)
 
 KeyType = Union[str, bytes]
 _PEXPIRETIME_CACHE_ATTR = "_redis_sync_pexpiretime_supported"
+MAX_DUMP_BATCH_BYTES = 16 * 1024 * 1024
 
 
 class SourceStateChangedError(RuntimeError):
     """The source no longer matches the immutable state selected for delivery."""
+
+
+@dataclass(frozen=True)
+class CapturedDumpState:
+    """One atomically captured source value after dynamic-scope preflight."""
+
+    dump_data: Any
+    pttl_ms: int
+    expires_at_ms: Optional[int]
+    remaining_ttl_ms: int
+    key_type: Any = None
+    memory_size: Any = None
+    expiry_is_exact: bool = False
 
 
 def _is_busykey_error(error: redis.ResponseError) -> bool:
@@ -85,11 +100,265 @@ def source_supports_pexpiretime(source: redis.Redis, probe_key: KeyType) -> bool
         supported = False
     else:
         supported = type(response) is int
+    cache_source_pexpiretime_support(source, supported)
+    return supported
+
+
+def cache_source_pexpiretime_support(source: redis.Redis, supported: bool) -> None:
+    """Update the per-client capability cache without requiring mutable clients."""
     try:
-        setattr(source, _PEXPIRETIME_CACHE_ATTR, supported)
+        setattr(source, _PEXPIRETIME_CACHE_ATTR, bool(supported))
     except Exception:
         pass
-    return supported
+
+
+def is_pexpiretime_capability_error(error: BaseException) -> bool:
+    """Return whether a cached-positive PEXPIRETIME capability became invalid."""
+    if isinstance(error, redis.exceptions.ExecAbortError):
+        # PEXPIRETIME is the only optional command queued by these captures. A
+        # retry without it will either succeed or expose any unrelated error.
+        return True
+    if not isinstance(error, redis.ResponseError):
+        return False
+    message = str(error).lower()
+    return "pexpiretime" in message and any(
+        marker in message
+        for marker in (
+            "unknown command",
+            "noperm",
+            "permission",
+            "unsupported",
+            "not allowed",
+        )
+    )
+
+
+def _execute_pipeline_allowing_errors(pipe):
+    """Execute redis-py pipelines while keeping lightweight test doubles usable."""
+    try:
+        return pipe.execute(raise_on_error=False)
+    except TypeError as error:
+        if "raise_on_error" not in str(error):
+            raise
+        return pipe.execute()
+
+
+def _known_integer(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _preflight_out_of_scope(
+    pttl: Any,
+    *,
+    key_type: Any,
+    memory_size: Any,
+    key_types: Iterable[Union[str, bytes]],
+    min_ttl: int,
+    max_key_size: int,
+) -> bool:
+    """Evaluate only concrete WATCH replies; mocks/older clients fall through."""
+    ttl_value = _known_integer(pttl)
+    if ttl_value is not None:
+        if ttl_value in (-2, 0):
+            return True
+        if ttl_value < -2:
+            raise ValueError(f"invalid PTTL response: {ttl_value}")
+        if min_ttl > 0 and 0 < ttl_value < int(min_ttl) * 1000:
+            return True
+
+    allowed_types = tuple(key_types or ())
+    if allowed_types and isinstance(key_type, (str, bytes)):
+        if not source_state_in_dynamic_scope(
+            ttl_value if ttl_value is not None else -1,
+            key_type=key_type,
+            key_types=allowed_types,
+        ):
+            return True
+
+    size_value = _known_integer(memory_size)
+    if size_value is not None and max_key_size > 0:
+        if size_value > int(max_key_size):
+            return True
+    return False
+
+
+def capture_dump_with_preflight(
+    source: redis.Redis,
+    key: KeyType,
+    *,
+    preserve_ttl: bool = True,
+    key_types: Optional[Iterable[Union[str, bytes]]] = None,
+    min_ttl: int = 0,
+    max_key_size: int = 0,
+    max_watch_retries: int = 3,
+    _pexpiretime_override: Optional[bool] = None,
+) -> Optional[CapturedDumpState]:
+    """Capture one DUMP after a WATCH-protected size/scope preflight.
+
+    When ``max_key_size`` is active, a key already above the limit is rejected
+    before Redis is asked to serialize it.  TYPE, TTL and MEMORY are sampled
+    again in EXEC, so a concurrent change either aborts WATCH or is rejected by
+    the second scope check.
+    """
+
+    allowed_key_types = tuple(key_types or ())
+    needs_type = bool(allowed_key_types)
+    needs_memory = int(max_key_size) > 0
+    has_pexpiretime = preserve_ttl and (
+        source_supports_pexpiretime(source, key)
+        if _pexpiretime_override is None
+        else bool(_pexpiretime_override)
+    )
+
+    for attempt in range(max(1, int(max_watch_retries))):
+        pipe = source.pipeline(transaction=True)
+        watch_supported = needs_memory and callable(getattr(pipe, "watch", None))
+        try:
+            if watch_supported:
+                pipe.watch(key)
+                preflight_pttl = pipe.pttl(key)
+                preflight_type = pipe.type(key) if needs_type else None
+                preflight_memory = pipe.execute_command("MEMORY", "USAGE", key)
+                if _preflight_out_of_scope(
+                    preflight_pttl,
+                    key_type=preflight_type,
+                    memory_size=preflight_memory,
+                    key_types=allowed_key_types,
+                    min_ttl=min_ttl,
+                    max_key_size=max_key_size,
+                ):
+                    return None
+                pipe.multi()
+
+            pipe.dump(key)
+            pipe.pttl(key)
+            if has_pexpiretime:
+                pipe.execute_command("PEXPIRETIME", key)
+            if needs_type:
+                pipe.type(key)
+            if needs_memory:
+                pipe.execute_command("MEMORY", "USAGE", key)
+            sample_started_ns = time.monotonic_ns()
+            raw = _execute_pipeline_allowing_errors(pipe)
+        except redis.WatchError:
+            if attempt + 1 >= max(1, int(max_watch_retries)):
+                raise SourceStateChangedError(
+                    f"source key changed during capture: {key!r}"
+                )
+            continue
+        except Exception as error:
+            if has_pexpiretime and is_pexpiretime_capability_error(error):
+                cache_source_pexpiretime_support(source, False)
+                return capture_dump_with_preflight(
+                    source,
+                    key,
+                    preserve_ttl=preserve_ttl,
+                    key_types=allowed_key_types,
+                    min_ttl=min_ttl,
+                    max_key_size=max_key_size,
+                    max_watch_retries=max_watch_retries,
+                    _pexpiretime_override=False,
+                )
+            raise
+        finally:
+            reset = getattr(pipe, "reset", None)
+            if callable(reset):
+                try:
+                    reset()
+                except Exception:
+                    pass
+
+        expected = 2 + int(has_pexpiretime) + int(needs_type) + int(needs_memory)
+        if len(raw) != expected:
+            raise RuntimeError(
+                f"source capture response count mismatch: {len(raw)} != {expected}"
+            )
+        response_index = 0
+        dump_data = raw[response_index]
+        response_index += 1
+        pttl = raw[response_index]
+        response_index += 1
+        pexpiretime = raw[response_index] if has_pexpiretime else None
+        response_index += int(has_pexpiretime)
+        key_type = raw[response_index] if needs_type else None
+        response_index += int(needs_type)
+        memory_size = raw[response_index] if needs_memory else None
+
+        if isinstance(pexpiretime, BaseException):
+            if isinstance(pexpiretime, redis.ResponseError):
+                cache_source_pexpiretime_support(source, False)
+                return capture_dump_with_preflight(
+                    source,
+                    key,
+                    preserve_ttl=preserve_ttl,
+                    key_types=allowed_key_types,
+                    min_ttl=min_ttl,
+                    max_key_size=max_key_size,
+                    max_watch_retries=max_watch_retries,
+                    _pexpiretime_override=False,
+                )
+            raise pexpiretime
+
+        for value in (dump_data, pttl, key_type, memory_size):
+            if isinstance(value, BaseException):
+                raise value
+        if dump_data is None:
+            return None
+        try:
+            ttl_ms = int(pttl)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"invalid PTTL response: {pttl!r}") from error
+        if ttl_ms in (-2, 0):
+            return None
+        if ttl_ms < -2:
+            raise ValueError(f"invalid PTTL response: {ttl_ms}")
+        if needs_memory and memory_size is None:
+            raise RuntimeError(f"MEMORY USAGE returned null for existing key {key!r}")
+
+        observed_at_ms = int(time.time() * 1000)
+        expires_at_ms = None
+        expiry_is_exact = False
+        remaining_ttl_ms = ttl_ms
+        if ttl_ms > 0:
+            try:
+                absolute_ms = int(pexpiretime)
+            except (TypeError, ValueError):
+                absolute_ms = -1
+            elapsed_ms = (
+                max(0, time.monotonic_ns() - sample_started_ns) + 999_999
+            ) // 1_000_000
+            remaining_ttl_ms = ttl_ms - elapsed_ms
+            if remaining_ttl_ms <= 0:
+                return None
+            if preserve_ttl and absolute_ms > 0:
+                expires_at_ms = absolute_ms
+                expiry_is_exact = True
+            else:
+                if preserve_ttl:
+                    expires_at_ms = observed_at_ms + remaining_ttl_ms
+
+        if not source_state_in_dynamic_scope(
+            remaining_ttl_ms,
+            key_type=key_type,
+            memory_size=memory_size,
+            key_types=allowed_key_types,
+            min_ttl=min_ttl,
+            max_key_size=max_key_size,
+        ):
+            return None
+        return CapturedDumpState(
+            dump_data=dump_data,
+            pttl_ms=ttl_ms,
+            expires_at_ms=expires_at_ms,
+            remaining_ttl_ms=remaining_ttl_ms,
+            key_type=key_type,
+            memory_size=memory_size,
+            expiry_is_exact=expiry_is_exact,
+        )
+
+    raise SourceStateChangedError(f"source key capture did not complete: {key!r}")
 
 
 def _restore_dump_via_temporary_key(
@@ -99,6 +368,7 @@ def _restore_dump_via_temporary_key(
     expires_at_ms: int,
     *,
     overwrite: bool,
+    expires_at_is_exact: bool,
 ) -> bool:
     """Restore for Redis < 5 without exposing or mutating a partial value."""
     temporary_key = _temporary_key()
@@ -108,7 +378,10 @@ def _restore_dump_via_temporary_key(
         temporary_may_exist = True
 
         if not target.pexpireat(temporary_key, int(expires_at_ms)):
-            if expires_at_ms > int(time.time() * 1000):
+            if (
+                expires_at_is_exact
+                or expires_at_ms > int(time.time() * 1000)
+            ):
                 raise RuntimeError(
                     f"RESTORE 临时键在设置过期时间前消失: {temporary_key!r}"
                 )
@@ -126,7 +399,10 @@ def _restore_dump_via_temporary_key(
             # The temporary key can expire between PEXPIREAT and RENAME.
             if not _is_missing_key_error(error):
                 raise
-            if expires_at_ms > int(time.time() * 1000):
+            if (
+                not expires_at_is_exact
+                and expires_at_ms > int(time.time() * 1000)
+            ):
                 raise
             if overwrite:
                 target.delete(key)
@@ -156,6 +432,7 @@ def restore_dump_with_deadline(
     *,
     overwrite: bool = True,
     prefer_absttl: bool = True,
+    expires_at_is_exact: bool = False,
 ) -> bool:
     """Restore a DUMP payload without adding target-bound network delay to TTL."""
     if expires_at_ms is None:
@@ -168,12 +445,6 @@ def restore_dump_with_deadline(
         return True
 
     expires_at_ms = int(expires_at_ms)
-    if expires_at_ms <= int(time.time() * 1000):
-        if overwrite:
-            target.delete(key)
-            return True
-        return False
-
     if prefer_absttl:
         try:
             target.restore(
@@ -196,6 +467,7 @@ def restore_dump_with_deadline(
         dump_data,
         expires_at_ms,
         overwrite=overwrite,
+        expires_at_is_exact=expires_at_is_exact,
     )
 
 
@@ -280,31 +552,86 @@ def sync_key_with_dump_restore(
 
         allowed_key_types = tuple(key_types or ())
         needs_type = bool(allowed_key_types)
-        needs_memory = int(max_key_size) > 0
+        captured_state = None
+        if int(max_key_size) > 0:
+            captured_state = capture_dump_with_preflight(
+                source,
+                key,
+                preserve_ttl=preserve_ttl,
+                key_types=allowed_key_types,
+                min_ttl=min_ttl,
+                max_key_size=max_key_size,
+            )
+            if captured_state is None:
+                if not source.exists(key):
+                    if overwrite:
+                        target.delete(key)
+                        return True
+                return False
+            dump_data = captured_state.dump_data
+            pttl = captured_state.remaining_ttl_ms
+            pexpiretime = captured_state.expires_at_ms
+            key_type = captured_state.key_type
+            memory_size = captured_state.memory_size
+            pttl_sample_started_ns = None
+        else:
+            # MULTI/EXEC keeps payload, TTL and type in one source state. Retry
+            # once without Redis 7's optional PEXPIRETIME if a cached-positive
+            # capability becomes invalid after a restart or ACL change.
+            has_pexpiretime = preserve_ttl and source_supports_pexpiretime(
+                source, key
+            )
+            while True:
+                pipe = source.pipeline(transaction=True)
+                try:
+                    pipe.dump(key)
+                    pipe.pttl(key)
+                    if has_pexpiretime:
+                        pipe.execute_command("PEXPIRETIME", key)
+                    if needs_type:
+                        pipe.type(key)
+                    pttl_sample_started_ns = time.monotonic_ns()
+                    results = _execute_pipeline_allowing_errors(pipe)
+                except Exception as error:
+                    if has_pexpiretime and is_pexpiretime_capability_error(error):
+                        cache_source_pexpiretime_support(source, False)
+                        has_pexpiretime = False
+                        continue
+                    raise
+                finally:
+                    reset = getattr(pipe, "reset", None)
+                    if callable(reset):
+                        try:
+                            reset()
+                        except Exception:
+                            pass
 
-        # MULTI/EXEC keeps the payload, TTL, type and size in one source state.
-        has_pexpiretime = preserve_ttl and source_supports_pexpiretime(source, key)
-        pipe = source.pipeline(transaction=True)
-        pipe.dump(key)
-        pipe.pttl(key)
-        if has_pexpiretime:
-            pipe.execute_command("PEXPIRETIME", key)
-        if needs_type:
-            pipe.type(key)
-        if needs_memory:
-            pipe.execute_command("MEMORY", "USAGE", key)
-        pttl_sample_started_ns = time.monotonic_ns()
-        results = pipe.execute(raise_on_error=False)
-        result_index = 0
-        dump_data = results[result_index]
-        result_index += 1
-        pttl = results[result_index]
-        result_index += 1
-        pexpiretime = results[result_index] if has_pexpiretime else None
-        result_index += int(has_pexpiretime)
-        key_type = results[result_index] if needs_type else None
-        result_index += int(needs_type)
-        memory_size = results[result_index] if needs_memory else None
+                expected = 2 + int(has_pexpiretime) + int(needs_type)
+                if len(results) != expected:
+                    raise RuntimeError(
+                        "source capture response count mismatch: "
+                        f"{len(results)} != {expected}"
+                    )
+                result_index = 0
+                dump_data = results[result_index]
+                result_index += 1
+                pttl = results[result_index]
+                result_index += 1
+                pexpiretime = (
+                    results[result_index] if has_pexpiretime else None
+                )
+                result_index += int(has_pexpiretime)
+                key_type = results[result_index] if needs_type else None
+                memory_size = None
+                if isinstance(pexpiretime, BaseException):
+                    if has_pexpiretime and isinstance(
+                        pexpiretime, redis.ResponseError
+                    ):
+                        cache_source_pexpiretime_support(source, False)
+                        has_pexpiretime = False
+                        continue
+                    raise pexpiretime
+                break
 
         for value in (dump_data, pttl, key_type, memory_size):
             if isinstance(value, BaseException):
@@ -320,6 +647,12 @@ def sync_key_with_dump_restore(
             p = int(pttl)
         except (TypeError, ValueError) as e:
             raise ValueError(f"无效的 PTTL 响应: {pttl!r}") from e
+
+        if captured_state is None and p > 0:
+            elapsed_ms = (
+                max(0, time.monotonic_ns() - pttl_sample_started_ns) + 999_999
+            ) // 1_000_000
+            p = max(0, p - elapsed_ms)
 
         # DUMP 成功后键仍可能在 PTTL 前到期。0/-2 不能映射为 RESTORE 的
         # TTL=0，否则会把已到期键恢复成永久键。
@@ -341,18 +674,21 @@ def sync_key_with_dump_restore(
             return False
 
         expires_at_ms = None
+        expires_at_is_exact = False
         if preserve_ttl and p > 0:
-            try:
-                absolute_ms = int(pexpiretime)
-            except (TypeError, ValueError):
-                absolute_ms = -1
-            if absolute_ms > 0:
-                expires_at_ms = absolute_ms
+            if captured_state is not None:
+                expires_at_ms = captured_state.expires_at_ms
+                expires_at_is_exact = captured_state.expiry_is_exact
             else:
-                expires_at_ms = expiry_deadline_from_pttl(
-                    p,
-                    pttl_sample_started_ns,
-                )
+                try:
+                    absolute_ms = int(pexpiretime)
+                except (TypeError, ValueError):
+                    absolute_ms = -1
+                if absolute_ms > 0:
+                    expires_at_ms = absolute_ms
+                    expires_at_is_exact = True
+                else:
+                    expires_at_ms = int(time.time() * 1000) + p
             if expires_at_ms is None:
                 if overwrite:
                     target.delete(key)
@@ -365,6 +701,7 @@ def sync_key_with_dump_restore(
                 dump_data,
                 expires_at_ms,
                 overwrite=overwrite,
+                expires_at_is_exact=expires_at_is_exact,
             )
         except redis.ResponseError as e:
             if not _is_restore_compatibility_error(e):
@@ -386,6 +723,7 @@ def sync_key_with_dump_restore(
                 key_types=allowed_key_types,
                 min_ttl=min_ttl,
                 max_key_size=max_key_size,
+                expires_at_is_exact=expires_at_is_exact,
             )
 
     except Exception as e:
@@ -407,6 +745,7 @@ def _sync_key_fallback(
     key_types: Optional[Iterable[Union[str, bytes]]] = None,
     min_ttl: int = 0,
     max_key_size: int = 0,
+    expires_at_is_exact: bool = False,
 ) -> bool:
     """在临时键上完成兼容复制，再原子替换正式键。
 
@@ -445,8 +784,9 @@ def _sync_key_fallback(
     needs_memory = int(max_key_size) > 0
     has_pexpiretime = preserve_ttl and source_supports_pexpiretime(source, key)
     captured = None
+    watch_failures = 0
 
-    for attempt in range(3):
+    while watch_failures < 3:
         pipe = source.pipeline()
         try:
             pipe.watch(key)
@@ -456,6 +796,24 @@ def _sync_key_fallback(
                 if isinstance(key_type_b, bytes)
                 else str(key_type_b)
             )
+
+            if needs_memory:
+                preflight_pttl = pipe.pttl(key)
+                preflight_memory = pipe.execute_command("MEMORY", "USAGE", key)
+                for response in (preflight_pttl, preflight_memory):
+                    if isinstance(response, BaseException):
+                        raise response
+                if _preflight_out_of_scope(
+                    preflight_pttl,
+                    key_type=key_type_b,
+                    memory_size=preflight_memory,
+                    key_types=allowed_key_types,
+                    min_ttl=min_ttl,
+                    max_key_size=max_key_size,
+                ):
+                    raise SourceStateChangedError(
+                        f"源键在兼容降级读取前移出过滤范围: {key!r}"
+                    )
 
             if key_type == "string":
                 value = pipe.get(key)
@@ -496,13 +854,20 @@ def _sync_key_fallback(
             if needs_memory:
                 pipe.execute_command("MEMORY", "USAGE", key)
             validation_started_ns = time.monotonic_ns()
-            raw = pipe.execute(raise_on_error=False)
+            raw = _execute_pipeline_allowing_errors(pipe)
         except redis.WatchError:
-            if attempt == 2:
+            watch_failures += 1
+            if watch_failures >= 3:
                 raise SourceStateChangedError(
                     f"源键在兼容降级读取期间持续变化: {key!r}"
                 )
             continue
+        except Exception as error:
+            if has_pexpiretime and is_pexpiretime_capability_error(error):
+                cache_source_pexpiretime_support(source, False)
+                has_pexpiretime = False
+                continue
+            raise
         finally:
             try:
                 pipe.reset()
@@ -519,6 +884,14 @@ def _sync_key_fallback(
         current_type = raw[result_index] if needs_type else key_type_b
         result_index += int(needs_type)
         current_memory = raw[result_index] if needs_memory else None
+        if isinstance(current_pexpiretime, BaseException):
+            if has_pexpiretime and isinstance(
+                current_pexpiretime, redis.ResponseError
+            ):
+                cache_source_pexpiretime_support(source, False)
+                has_pexpiretime = False
+                continue
+            raise current_pexpiretime
         for response in (
             current_dump,
             current_pttl,
@@ -541,6 +914,17 @@ def _sync_key_fallback(
         if current_pttl_value < -2:
             raise ValueError(f"无效的 PTTL 响应: {current_pttl_value}")
 
+        elapsed_ms = (
+            max(0, time.monotonic_ns() - validation_started_ns) + 999_999
+        ) // 1_000_000
+        remaining_pttl = current_pttl_value
+        if current_pttl_value > 0:
+            remaining_pttl = current_pttl_value - elapsed_ms
+            if remaining_pttl <= 0:
+                raise SourceStateChangedError(
+                    f"源键在兼容降级前到期: {key!r}"
+                )
+
         current_deadline = None
         deadline_is_exact = False
         if preserve_ttl and current_pttl_value > 0:
@@ -561,13 +945,6 @@ def _sync_key_fallback(
                     f"源键在兼容降级前到期: {key!r}"
                 )
 
-        remaining_pttl = current_pttl_value
-        if current_deadline is not None:
-            remaining_pttl = current_deadline - int(time.time() * 1000)
-            if remaining_pttl <= 0:
-                raise SourceStateChangedError(
-                    f"源键在兼容降级前到期: {key!r}"
-                )
         if not source_state_in_dynamic_scope(
             remaining_pttl,
             key_type=current_type,
@@ -589,7 +966,9 @@ def _sync_key_fallback(
                     f"源键在兼容降级前过期策略发生变化: {key!r}"
                 )
             if expires_at_ms is not None:
-                allowed_drift_ms = 0 if deadline_is_exact else 1000
+                allowed_drift_ms = (
+                    0 if deadline_is_exact and expires_at_is_exact else 1000
+                )
                 if abs(int(expires_at_ms) - int(current_deadline)) > allowed_drift_ms:
                     raise SourceStateChangedError(
                         f"源键在兼容降级前过期时间发生变化: {key!r}"
@@ -626,13 +1005,11 @@ def _sync_key_fallback(
             target.hset(temporary_key, mapping=values)
 
         if expires_at_ms is not None:
-            if expires_at_ms <= int(time.time() * 1000):
-                if overwrite:
-                    target.delete(key)
-                    return True
-                return False
             if not target.pexpireat(temporary_key, int(expires_at_ms)):
-                if expires_at_ms > int(time.time() * 1000):
+                if (
+                    expires_at_is_exact
+                    or expires_at_ms > int(time.time() * 1000)
+                ):
                     raise RuntimeError(
                         f"降级复制临时键在设置过期时间前消失: {temporary_key!r}"
                     )
@@ -649,7 +1026,10 @@ def _sync_key_fallback(
         except redis.ResponseError as error:
             if expires_at_ms is None or not _is_missing_key_error(error):
                 raise
-            if expires_at_ms > int(time.time() * 1000):
+            if (
+                not expires_at_is_exact
+                and expires_at_ms > int(time.time() * 1000)
+            ):
                 raise
             if overwrite:
                 target.delete(key)

@@ -17,9 +17,9 @@ from .exceptions import MigrationError
 from .key_sync import (
     _is_restore_compatibility_error,
     _sync_key_fallback,
+    capture_dump_with_preflight,
     redis_values_equal,
     restore_dump_with_deadline,
-    source_supports_pexpiretime,
     sync_key_with_dump_restore,
 )
 from .sync_filters import KeySyncFilter, build_atomic_filtered_delete_command
@@ -38,6 +38,7 @@ class IncrementalMigrationHandler:
 
     SCAN_MAX_RETRIES = 3
     SCAN_RETRY_DELAY = 0.1
+    THREAD_JOIN_TIMEOUT = 10
 
     def __init__(self, source_client: redis.Redis, target_client: redis.Redis, scan_count: int = 10000):
         """
@@ -56,6 +57,7 @@ class IncrementalMigrationHandler:
         self.is_monitoring = False
         self.monitor_thread = None
         self.stop_event = threading.Event()
+        self._monitor_lock = threading.Lock()
         self._stats_lock = threading.Lock()
         self._detection_turn_lock = threading.Lock()
         self._prefer_deletions_next = False
@@ -91,31 +93,43 @@ class IncrementalMigrationHandler:
         返回:
             是否成功启动
         """
-        if self.is_monitoring:
-            logger.warning("增量同步已在运行")
-            return False
-        
-        logger.info(f"启动增量同步，间隔: {sync_interval}秒")
-        
-        self.incremental_stats['start_time'] = datetime.now()
-        self.last_sync_time = time.time()
-        self.is_monitoring = True
-        self.stop_event.clear()
-        
-        # 启动监控线程
-        self.monitor_thread = threading.Thread(
-            target=self._incremental_sync_worker,
-            args=(
-                sync_interval,
-                key_pattern,
-                key_types,
-                change_callback,
-                max_changes_per_sync,
-                key_filter,
-            ),
-            daemon=True
-        )
-        self.monitor_thread.start()
+        with self._monitor_lock:
+            active_thread = self.monitor_thread
+            if self.is_monitoring or (
+                active_thread is not None and active_thread.is_alive()
+            ):
+                logger.warning("增量同步已在运行")
+                return False
+
+            logger.info(f"启动增量同步，间隔: {sync_interval}秒")
+
+            self.incremental_stats['start_time'] = datetime.now()
+            self.last_sync_time = time.time()
+            self.stop_event.clear()
+            self.is_monitoring = True
+
+            # Assign the worker before start so its finalizer can identify
+            # whether it still owns the lifecycle state.
+            worker = threading.Thread(
+                target=self._incremental_sync_worker,
+                args=(
+                    sync_interval,
+                    key_pattern,
+                    key_types,
+                    change_callback,
+                    max_changes_per_sync,
+                    key_filter,
+                ),
+                daemon=True
+            )
+            self.monitor_thread = worker
+            try:
+                worker.start()
+            except Exception:
+                self.monitor_thread = None
+                self.is_monitoring = False
+                self.stop_event.set()
+                raise
         
         return True
     
@@ -126,16 +140,34 @@ class IncrementalMigrationHandler:
         返回:
             同步统计信息
         """
-        if not self.is_monitoring:
-            logger.warning("增量同步未在运行")
-            return self.incremental_stats
-        
-        logger.info("停止增量同步")
-        self.stop_event.set()
-        self.is_monitoring = False
-        
-        if self.monitor_thread and self.monitor_thread.is_alive():
-            self.monitor_thread.join(timeout=10)
+        with self._monitor_lock:
+            worker = self.monitor_thread
+            if not self.is_monitoring and not (
+                worker is not None and worker.is_alive()
+            ):
+                logger.warning("增量同步未在运行")
+                return self.incremental_stats
+
+            logger.info("停止增量同步")
+            self.stop_event.set()
+
+        if (
+            worker is not None
+            and worker.is_alive()
+            and worker is not threading.current_thread()
+        ):
+            worker.join(timeout=self.THREAD_JOIN_TIMEOUT)
+
+        with self._monitor_lock:
+            if worker is not None and worker.is_alive():
+                # Keep ownership and the stop event intact. A subsequent start
+                # must not revive this worker or create a second one.
+                self.is_monitoring = True
+                logger.error("增量同步工作线程未在超时时间内停止")
+            else:
+                if self.monitor_thread is worker:
+                    self.monitor_thread = None
+                self.is_monitoring = False
         
         return self.incremental_stats
     
@@ -280,33 +312,38 @@ class IncrementalMigrationHandler:
                                 key_filter: Optional[KeySyncFilter]):
         """增量同步工作线程。"""
         logger.info("增量同步工作线程启动")
-        
-        while not self.stop_event.is_set():
-            try:
-                # 执行增量同步
-                result = self.perform_incremental_sync(
-                    key_pattern,
-                    key_types,
-                    None,
-                    max_changes_per_sync,
-                    key_filter=key_filter,
-                )
-                
-                # 调用变更回调
-                if change_callback and result['success']:
-                    try:
-                        change_callback(result)
-                    except Exception as e:
-                        logger.error(f"变更回调执行失败: {e}")
-                
-                # 等待下次同步
-                self.stop_event.wait(sync_interval)
-                
-            except Exception as e:
-                logger.error(f"增量同步工作线程出错: {e}")
-                self.stop_event.wait(sync_interval)
-        
-        logger.info("增量同步工作线程停止")
+
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    # 执行增量同步
+                    result = self.perform_incremental_sync(
+                        key_pattern,
+                        key_types,
+                        None,
+                        max_changes_per_sync,
+                        key_filter=key_filter,
+                    )
+
+                    # 调用变更回调
+                    if change_callback and result['success']:
+                        try:
+                            change_callback(result)
+                        except Exception as e:
+                            logger.error(f"变更回调执行失败: {e}")
+
+                    # 等待下次同步
+                    self.stop_event.wait(sync_interval)
+
+                except Exception as e:
+                    logger.error(f"增量同步工作线程出错: {e}")
+                    self.stop_event.wait(sync_interval)
+        finally:
+            with self._monitor_lock:
+                if self.monitor_thread is threading.current_thread():
+                    self.monitor_thread = None
+                    self.is_monitoring = False
+            logger.info("增量同步工作线程停止")
     
     def _detect_changed_keys(self,
                            key_pattern: str,
@@ -502,7 +539,7 @@ class IncrementalMigrationHandler:
         如果键不存在于目标或值不同，则认为是变更。
         """
         changed_keys = []
-        seen_keys = set(exclude_keys)
+        selected_keys = set(exclude_keys)
 
         cursor = 0
         scanned_count = 0
@@ -517,7 +554,13 @@ class IncrementalMigrationHandler:
                     max(1, self.scan_count // 2),
                 )
 
-                candidates = list(keys)
+                page_seen = set()
+                candidates = []
+                for key in keys:
+                    if key in page_seen or key in selected_keys:
+                        continue
+                    page_seen.add(key)
+                    candidates.append(key)
                 if key_filter and candidates:
                     candidates = list(
                         key_filter.filter_batch(self.source_client, candidates)
@@ -525,13 +568,6 @@ class IncrementalMigrationHandler:
 
                 for key in candidates:
                     scanned_count += 1
-
-                    # SCAN can return the same key on multiple pages while the
-                    # hash table is being rehashed. Count each key once per pass
-                    # so duplicates cannot consume the bounded change budget.
-                    if key in seen_keys:
-                        continue
-                    seen_keys.add(key)
 
                     # 检查键类型
                     if key_types:
@@ -545,6 +581,7 @@ class IncrementalMigrationHandler:
                     is_different, reason = self._is_key_different(key)
                     if is_different:
                         changed_keys.append(key)
+                        selected_keys.add(key)
                         logger.debug("检测到变更键: %r, 原因: %s", key, reason)
 
                         if len(changed_keys) >= max_changes:
@@ -572,17 +609,18 @@ class IncrementalMigrationHandler:
         if max_changes <= 0:
             return []
         deleted = []
-        seen_keys = set(exclude_keys)
+        selected_keys = set(exclude_keys)
         cursor = 0
         while len(deleted) < max_changes:
             cursor, raw_keys = self._scan_target_page(
                 cursor, key_pattern, max(1, self.scan_count)
             )
             keys = []
+            page_seen = set()
             for key in raw_keys:
-                if key in seen_keys:
+                if key in page_seen or key in selected_keys:
                     continue
-                seen_keys.add(key)
+                page_seen.add(key)
                 keys.append(key)
             if key_filter:
                 keys = list(key_filter.filter_batch(self.target_client, list(keys)))
@@ -644,6 +682,7 @@ class IncrementalMigrationHandler:
                 for key in keys:
                     if key not in allowed_set:
                         deleted.append(key)
+                        selected_keys.add(key)
                         if len(deleted) >= max_changes:
                             break
             if cursor == 0:
@@ -700,103 +739,23 @@ class IncrementalMigrationHandler:
     ):
         """Atomically capture one source value and its dynamic filter state."""
         if key_filter and not key_filter.name_allowed(key):
-            return False, None, None
-
-        has_pexpiretime = source_supports_pexpiretime(self.source_client, key)
-        need_type = bool(key_types)
-        need_memory = bool(key_filter and key_filter.max_key_size > 0)
-        pipe = self.source_client.pipeline(transaction=True)
-        pipe.dump(key)
-        pipe.pttl(key)
-        if has_pexpiretime:
-            pipe.execute_command("PEXPIRETIME", key)
-        if need_type:
-            pipe.type(key)
-        if need_memory:
-            pipe.execute_command("MEMORY", "USAGE", key)
-
-        sample_started_ns = time.monotonic_ns()
-        raw = pipe.execute(raise_on_error=False)
-        expected = 2 + int(has_pexpiretime) + int(need_type) + int(need_memory)
-        if len(raw) != expected:
-            raise RuntimeError(
-                f"源端过滤采样返回数量不匹配: {len(raw)} != {expected}"
-            )
-        for response_index, value in enumerate(raw):
-            # Capability is cached per client, so a Redis failover or live ACL
-            # change can invalidate a previously successful PEXPIRETIME probe.
-            # PTTL from this same EXEC still gives us a conservative deadline.
-            if (
-                isinstance(value, BaseException)
-                and not (has_pexpiretime and response_index == 2)
-            ):
-                raise value
-
-        index = 0
-        dump_data = raw[index]
-        index += 1
-        ttl_ms = int(raw[index])
-        index += 1
-        expiry_value = raw[index] if has_pexpiretime else None
-        index += int(has_pexpiretime)
-        key_type = raw[index] if need_type else None
-        index += int(need_type)
-        memory_size = raw[index] if need_memory else None
-
-        if dump_data is None or ttl_ms in (-2, 0):
-            return False, None, None
-        if ttl_ms < -2:
-            raise ValueError(f"无效的 PTTL 响应: {ttl_ms}")
-
-        expires_at_ms = None
-        remaining_ttl_ms = None
-        if ttl_ms > 0:
-            observed_at_ms = int(time.time() * 1000)
-            try:
-                absolute_ms = int(expiry_value)
-            except (TypeError, ValueError):
-                absolute_ms = -1
-            if absolute_ms > 0:
-                expires_at_ms = absolute_ms
-                remaining_ttl_ms = absolute_ms - observed_at_ms
-            else:
-                elapsed_ms = (
-                    max(0, time.monotonic_ns() - sample_started_ns) + 999_999
-                ) // 1_000_000
-                remaining_ttl_ms = ttl_ms - elapsed_ms
-                expires_at_ms = observed_at_ms + remaining_ttl_ms
-            if remaining_ttl_ms <= 0:
-                return False, None, None
-
-        if need_type:
-            normalized_type = (
-                key_type.decode("ascii", errors="replace").lower()
-                if isinstance(key_type, bytes)
-                else str(key_type).lower()
-            )
-            allowed_types = {
-                item.decode("ascii", errors="replace").lower()
-                if isinstance(item, bytes)
-                else str(item).lower()
-                for item in key_types or ()
-            }
-            if normalized_type not in allowed_types:
-                return False, None, None
-
-        if (
-            key_filter
-            and key_filter.min_ttl > 0
-            and remaining_ttl_ms is not None
-            and remaining_ttl_ms < key_filter.min_ttl * 1000
-        ):
-            return False, None, None
-        if (
-            need_memory
-            and memory_size is not None
-            and int(memory_size) > key_filter.max_key_size
-        ):
-            return False, None, None
-        return True, dump_data, expires_at_ms
+            return False, None, None, False
+        captured = capture_dump_with_preflight(
+            self.source_client,
+            key,
+            preserve_ttl=True,
+            key_types=key_types,
+            min_ttl=key_filter.min_ttl if key_filter else 0,
+            max_key_size=key_filter.max_key_size if key_filter else 0,
+        )
+        if captured is None:
+            return False, None, None, False
+        return (
+            True,
+            captured.dump_data,
+            captured.expires_at_ms,
+            captured.expiry_is_exact,
+        )
 
     def _sync_deletion_candidate(
         self,
@@ -884,7 +843,7 @@ class IncrementalMigrationHandler:
         """使用 DUMP/RESTORE 原子同步单个键（含流等类型）。"""
         try:
             if key_types or key_filter:
-                in_scope, dump_data, expires_at_ms = (
+                in_scope, dump_data, expires_at_ms, expiry_is_exact = (
                     self._capture_scoped_source_key(key, key_types, key_filter)
                 )
                 if not in_scope:
@@ -901,6 +860,7 @@ class IncrementalMigrationHandler:
                         dump_data,
                         expires_at_ms,
                         overwrite=True,
+                        expires_at_is_exact=expiry_is_exact,
                     )
                 except redis.ResponseError as error:
                     if not _is_restore_compatibility_error(error):
@@ -925,6 +885,7 @@ class IncrementalMigrationHandler:
                         key_types=key_types,
                         min_ttl=key_filter.min_ttl if key_filter else 0,
                         max_key_size=key_filter.max_key_size if key_filter else 0,
+                        expires_at_is_exact=expiry_is_exact,
                     )
                 if not restored:
                     return False

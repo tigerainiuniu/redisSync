@@ -1,22 +1,27 @@
 [Unit]
 Description=Redis Sync Service
-After=network.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
-User=bluepointer
-WorkingDirectory=/Users/bluepointer/PycharmProjects/redisSync
-Environment="PATH=/Users/bluepointer/PycharmProjects/redisSync/.venv/bin:/usr/local/bin:/usr/bin:/bin"
-ExecStart=/Users/bluepointer/PycharmProjects/redisSync/.venv/bin/python run_sync_service.py
+User=redis-sync
+Group=redis-sync
+WorkingDirectory=/opt/redis-sync
+ExecStart=/opt/redis-sync/.venv/bin/python /opt/redis-sync/run_sync_service.py --config /etc/redis-sync/config.yaml
 Restart=always
 RestartSec=10
-StandardOutput=append:/Users/bluepointer/PycharmProjects/redisSync/redis-sync.log
-StandardError=append:/Users/bluepointer/PycharmProjects/redisSync/redis-sync-error.log
+TimeoutStopSec=45
+StandardOutput=journal
+StandardError=journal
+LogsDirectory=redis-sync
+PrivateTmp=true
+UMask=0077
+NoNewPrivileges=true
 
 # 资源限制
 LimitNOFILE=65536
-MemoryLimit=4G
+MemoryMax=4G
 
 [Install]
 WantedBy=multi-user.target
-

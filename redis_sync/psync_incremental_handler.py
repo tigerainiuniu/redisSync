@@ -5,13 +5,20 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import stat
 import tempfile
 import threading
+import time
 from collections import deque
 from contextlib import contextmanager
 from typing import Callable, List, Optional, Tuple
 
 import redis
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None
 
 from .redis_protocol import (
     MAX_REPLICATION_BUFFER_SIZE,
@@ -26,6 +33,117 @@ from .redis_protocol import (
 
 logger = logging.getLogger(__name__)
 _WORKER_JOIN_TIMEOUT = 0.5
+_SPOOL_PREFIX = "redis-sync-repl-"
+_SPOOL_SUFFIX = ".spool"
+_SPOOL_CREATION_GRACE_SECONDS = 60
+_LEGACY_SPOOL_STALE_AGE_SECONDS = 24 * 60 * 60
+_ACTIVE_SPOOL_PATHS = set()
+_ACTIVE_SPOOL_PATHS_LOCK = threading.Lock()
+
+
+def _spool_owner_pid(name: str) -> Optional[int]:
+    if not name.startswith(_SPOOL_PREFIX) or not name.endswith(_SPOOL_SUFFIX):
+        return None
+    owner = name[len(_SPOOL_PREFIX):].split("-", 1)[0]
+    return int(owner) if owner.isdigit() else None
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _register_active_spool(path: str) -> None:
+    with _ACTIVE_SPOOL_PATHS_LOCK:
+        _ACTIVE_SPOOL_PATHS.add(os.path.abspath(path))
+
+
+def _unregister_active_spool(path: str) -> None:
+    with _ACTIVE_SPOOL_PATHS_LOCK:
+        _ACTIVE_SPOOL_PATHS.discard(os.path.abspath(path))
+
+
+def _cleanup_stale_spool_files(
+    directory: Optional[str] = None,
+    *,
+    now: Optional[float] = None,
+    legacy_stale_age: float = _LEGACY_SPOOL_STALE_AGE_SECONDS,
+) -> List[str]:
+    """Remove crash leftovers while preserving every live process's spool."""
+    directory = tempfile.gettempdir() if directory is None else directory
+    current_time = time.time() if now is None else float(now)
+    removed = []
+    try:
+        entries = list(os.scandir(directory))
+    except (FileNotFoundError, NotADirectoryError, PermissionError, OSError):
+        return removed
+
+    for entry in entries:
+        name = entry.name
+        if not name.startswith(_SPOOL_PREFIX) or not name.endswith(_SPOOL_SUFFIX):
+            continue
+        path = os.path.abspath(entry.path)
+        with _ACTIVE_SPOOL_PATHS_LOCK:
+            if path in _ACTIVE_SPOOL_PATHS:
+                continue
+        try:
+            entry_stat = entry.stat(follow_symlinks=False)
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+        if not stat.S_ISREG(entry_stat.st_mode):
+            continue
+
+        age = max(0.0, current_time - entry_stat.st_mtime)
+        owner_pid = _spool_owner_pid(name)
+        if owner_pid is not None:
+            owner_alive = _pid_is_alive(owner_pid)
+            if fcntl is None and owner_alive:
+                continue
+            # Protect the cross-process window between file creation and flock.
+            # Older files must still prove liveness through the lock because a
+            # PID may have been reused after a crash.
+            if owner_alive and age < _SPOOL_CREATION_GRACE_SECONDS:
+                continue
+        elif age < float(legacy_stale_age):
+            continue
+
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = None
+        try:
+            descriptor = os.open(path, flags)
+            opened_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(opened_stat.st_mode):
+                continue
+            if fcntl is not None:
+                try:
+                    fcntl.flock(
+                        descriptor,
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                except (BlockingIOError, PermissionError, OSError):
+                    continue
+            os.unlink(path)
+            removed.append(path)
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+    return removed
 
 
 class _ReplicationStopped(Exception):
@@ -42,6 +160,7 @@ class _CaptureSegment:
         self.write_position = 0
         self.sealed = False
         self.path: Optional[str] = None
+        self.lease_file = None
 
 
 class _DiskBackedCapture:
@@ -96,14 +215,21 @@ class _DiskBackedCapture:
 
         persisted = None
         path = None
+        registered = False
+        lease_locked = False
         try:
             persisted = tempfile.NamedTemporaryFile(
-                prefix="redis-sync-repl-",
-                suffix=".spool",
+                prefix=f"{_SPOOL_PREFIX}{os.getpid()}-",
+                suffix=_SPOOL_SUFFIX,
                 mode="w+b",
                 delete=False,
             )
             path = persisted.name
+            _register_active_spool(path)
+            registered = True
+            if fcntl is not None and callable(getattr(persisted, "fileno", None)):
+                fcntl.flock(persisted.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lease_locked = True
             source.seek(0)
             remaining = segment.write_position
             while remaining:
@@ -121,20 +247,29 @@ class _DiskBackedCapture:
                         f"{written}/{len(chunk)} bytes"
                     )
                 remaining -= len(chunk)
-            persisted.close()
-            persisted = None
+            persisted.flush()
         except Exception:
             if persisted is not None:
                 try:
                     persisted.close()
                 except Exception:
                     pass
+            if registered and path is not None:
+                _unregister_active_spool(path)
             if path is not None:
                 self._unlink_or_defer(path, incomplete=True)
             raise
 
         segment.file = None
         segment.path = path
+        if lease_locked:
+            # Keep the file descriptor and flock alive until the segment is
+            # consumed. Readers use a separate descriptor in ``segment.file``.
+            segment.lease_file = persisted
+            persisted = None
+        else:
+            persisted.close()
+            persisted = None
         segment.sealed = True
         self._ever_rolled = True
         try:
@@ -195,6 +330,14 @@ class _DiskBackedCapture:
         segment.path = None
         if path is not None:
             self._unlink_or_defer(path)
+            _unregister_active_spool(path)
+        lease_file = segment.lease_file
+        segment.lease_file = None
+        if lease_file is not None:
+            try:
+                lease_file.close()
+            except Exception:
+                logger.warning("failed to close replication spool lease", exc_info=True)
 
     def append(self, data: bytes) -> None:
         if not data:
@@ -362,6 +505,12 @@ class PSyncIncrementalHandler:
         materialize_snapshot: bool = True,
         capture_max_size: Optional[int] = None,
     ):
+        removed_spools = _cleanup_stale_spool_files()
+        if removed_spools:
+            logger.info(
+                "removed %s stale replication spool file(s)",
+                len(removed_spools),
+            )
         self.source_client = source_client
         self.buffer_size = int(buffer_size)
         if not 1 <= self.buffer_size <= MAX_REPLICATION_BUFFER_SIZE:
@@ -472,8 +621,8 @@ class PSyncIncrementalHandler:
         self.replication_thread.start()
         return True
 
-    def stop_replication(self):
-        """Stop replication and interrupt any blocking RDB/socket read."""
+    def stop_replication(self, timeout: float = 10.0) -> bool:
+        """Stop replication and report whether its worker actually exited."""
 
         self.running = False
         self._stop_event.set()
@@ -484,11 +633,23 @@ class PSyncIncrementalHandler:
                 connection.disconnect()
             except Exception:
                 pass
-        if (
-            self.replication_thread
-            and self.replication_thread is not threading.current_thread()
-        ):
-            self.replication_thread.join(timeout=10)
+        return self.wait_stopped(timeout)
+
+    def wait_stopped(self, timeout: float = 10.0) -> bool:
+        """Wait for the replication worker without claiming a timed-out stop."""
+        thread = self.replication_thread
+        if thread is None:
+            return True
+        if thread is threading.current_thread():
+            return False
+        thread.join(timeout=max(0.0, float(timeout)))
+        stopped = not thread.is_alive()
+        if not stopped:
+            logger.warning(
+                "PSYNC replication thread remains alive after %.1fs stop timeout",
+                float(timeout),
+            )
+        return stopped
 
     def _set_active_connection(self, connection) -> bool:
         with self._connection_lock:
@@ -971,6 +1132,7 @@ class PSyncIncrementalHandler:
                         callback_error = exc
                         logger.error("replication command callback failed: %s", exc)
                     if delivered is not False:
+                        self.last_error = None
                         break
 
                     self.last_error = callback_error or RuntimeError(

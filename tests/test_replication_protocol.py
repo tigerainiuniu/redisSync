@@ -853,6 +853,38 @@ def test_disk_backed_capture_reclaims_consumed_prefix_and_rolls_when_needed():
         capture.close()
 
 
+@pytest.mark.skipif(psync_module.fcntl is None, reason="requires POSIX flock")
+def test_psync_startup_cleans_sigkill_spools_without_deleting_locked_file(
+    monkeypatch, tmp_path
+):
+    old_mtime = time.time() - 2 * 24 * 60 * 60
+    dead_owner = tmp_path / "redis-sync-repl-1073741824-dead.spool"
+    reused_pid = tmp_path / f"redis-sync-repl-{os.getpid()}-unlocked.spool"
+    locked = tmp_path / f"redis-sync-repl-{os.getpid()}-locked.spool"
+    legacy = tmp_path / "redis-sync-repl-legacy.spool"
+    unrelated = tmp_path / "keep.txt"
+    for path in (dead_owner, reused_pid, locked, legacy, unrelated):
+        path.write_bytes(b"leftover")
+        os.utime(path, (old_mtime, old_mtime))
+
+    lease = open(locked, "rb")
+    psync_module.fcntl.flock(
+        lease.fileno(),
+        psync_module.fcntl.LOCK_EX | psync_module.fcntl.LOCK_NB,
+    )
+    monkeypatch.setattr(psync_module.tempfile, "gettempdir", lambda: str(tmp_path))
+    try:
+        PSyncIncrementalHandler(object())
+        assert not dead_owner.exists()
+        # A reused/live PID is insufficient evidence of liveness without flock.
+        assert not reused_pid.exists()
+        assert not legacy.exists()
+        assert locked.exists()
+        assert unrelated.exists()
+    finally:
+        lease.close()
+
+
 def test_disk_backed_capture_limit_rejects_append_and_cleans_all_segments(
     monkeypatch, tmp_path
 ):
@@ -1267,6 +1299,28 @@ def test_stop_during_pool_acquire_never_starts_handshake_or_snapshot():
     assert connection.sent == []
     assert snapshots == []
     assert pool.released == [connection]
+
+
+def test_stop_replication_reports_worker_timeout_and_later_exit():
+    allow_exit = threading.Event()
+    started = threading.Event()
+
+    def blocked_worker():
+        started.set()
+        allow_exit.wait(1)
+
+    handler = PSyncIncrementalHandler(object())
+    handler.running = True
+    handler.replication_thread = threading.Thread(target=blocked_worker)
+    handler.replication_thread.start()
+    assert started.wait(1)
+
+    assert handler.stop_replication(timeout=0.01) is False
+    assert handler.replication_thread.is_alive()
+
+    allow_exit.set()
+    assert handler.wait_stopped(timeout=1) is True
+    assert not handler.replication_thread.is_alive()
 
 
 def test_blocked_ack_worker_defers_pool_release_until_worker_exits(monkeypatch):

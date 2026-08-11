@@ -57,7 +57,7 @@ class MigrationConfig:
     replication_timeout: int = 30
     progress_callback: Optional[Callable[[int, int], None]] = None
     verify_migration: bool = True
-    verify_mode: str = "fast"  # 验证模式: fast（快速）, full（完整）
+    verify_mode: str = "full"  # 验证模式: full（完整）, fast（结构检查）
     verify_sample_size: Optional[int] = 100  # 验证采样数量
     max_retries: int = 3
     retry_delay: float = 1.0
@@ -97,7 +97,11 @@ def key_filter_from_migration_config(config: MigrationConfig):
 class MigrationOrchestrator:
     """使用各种策略编排Redis迁移。"""
 
-    def __init__(self, connection_manager: RedisConnectionManager):
+    def __init__(
+        self,
+        connection_manager: RedisConnectionManager,
+        shutdown_event: Optional[threading.Event] = None,
+    ):
         """
         初始化迁移编排器。
 
@@ -105,6 +109,7 @@ class MigrationOrchestrator:
             connection_manager: Redis连接管理器实例
         """
         self.connection_manager = connection_manager
+        self.shutdown_event = shutdown_event
         self.sync_handler: Optional[SyncHandler] = None
         self.scan_handler: Optional[ScanHandler] = None
         self.replconf_handler: Optional[ReplConfHandler] = None
@@ -112,6 +117,10 @@ class MigrationOrchestrator:
         self.incremental_migration_handler: Optional[IncrementalMigrationHandler] = None
         self._stop_replication = threading.Event()
         self._replication_thread: Optional[threading.Thread] = None
+
+    def _raise_if_cancelled(self) -> None:
+        if self.shutdown_event is not None and self.shutdown_event.is_set():
+            raise MigrationError("迁移已取消")
         
     def initialize_handlers(self, scan_count: int = 10000):
         """初始化迁移处理器。"""
@@ -135,7 +144,8 @@ class MigrationOrchestrator:
 
         self.full_migration_handler = FullMigrationHandler(
             self.connection_manager.source_client,
-            self.connection_manager.target_client
+            self.connection_manager.target_client,
+            stop_event=self.shutdown_event,
         )
 
         self.incremental_migration_handler = IncrementalMigrationHandler(
@@ -161,6 +171,8 @@ class MigrationOrchestrator:
                 "enable_replication 不适用于一次性迁移；"
                 "常驻复制请使用服务配置 sync.incremental_sync.method=psync"
             )
+
+        self._raise_if_cancelled()
 
         if not self.sync_handler or not self.scan_handler or not self.replconf_handler:
             self.initialize_handlers()
@@ -208,6 +220,7 @@ class MigrationOrchestrator:
                 and config.verify_migration
                 and config.migration_type == MigrationType.FULL
             ):
+                self._raise_if_cancelled()
                 verify_start = time.time()
                 logger.info("🔍 开始验证迁移...")
                 verification_results = self._verify_migration(config)
@@ -247,6 +260,7 @@ class MigrationOrchestrator:
 
     def _perform_full_migration(self, config: MigrationConfig) -> Dict[str, Any]:
         """执行全量迁移。"""
+        self._raise_if_cancelled()
         if not self.full_migration_handler:
             raise RuntimeError("全量迁移处理器未初始化")
 

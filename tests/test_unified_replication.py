@@ -1,5 +1,6 @@
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 import redis
@@ -163,9 +164,11 @@ class FakeTargetPool:
     def __init__(self, db=0, delay=0, failures=0):
         self.connection_kwargs = {"db": db}
         self.connection = FakeTargetConnection(delay=delay, failures=failures)
+        self.acquired = []
         self.released = []
 
     def get_connection(self, name=None):
+        self.acquired.append((name, self.connection))
         return self.connection
 
     def release(self, connection):
@@ -811,7 +814,7 @@ def test_key_state_uses_exact_pexpiretime_despite_source_rtt(monkeypatch):
         targets={"target": manager},
         config={"apply_mode": "key_state"},
     )
-    monotonic_clock = iter((0, 10_000_000_000))
+    monotonic_clock = iter((0, 100_000_000))
     monkeypatch.setattr(
         unified_incremental_service.time,
         "monotonic_ns",
@@ -963,6 +966,7 @@ def test_key_state_restore_compatibility_fallback_keeps_target_active(monkeypatc
                     "key_types": set(),
                     "min_ttl": 0,
                     "max_key_size": 0,
+                    "expires_at_is_exact": False,
                 },
             )
         ]
@@ -1357,38 +1361,372 @@ def test_key_state_mode_tracks_select_and_ignores_other_source_databases():
         service.stop()
 
 
-def test_target_timeout_waits_for_inflight_command_before_next_command():
-    manager, pool = target_manager(delay=0.05)
+def test_target_timeout_returns_at_deadline_and_releases_connection_once():
+    manager, pool = target_manager(delay=0.2)
     service = service_for(
         targets={"target": manager},
         config={"target_command_timeout": 0.01},
     )
-    results = []
-    def deliver(command):
-        with service._command_lock:
-            return service._sync_command_to_targets(command)
     try:
-        first = threading.Thread(
-            target=lambda: results.append(
-                deliver([b"SET", b"key", b"first"])
-            )
-        )
-        second = threading.Thread(
-            target=lambda: results.append(
-                deliver([b"SET", b"key", b"second"])
-            )
-        )
-        first.start()
-        time.sleep(0.005)
-        second.start()
-        first.join(timeout=2)
-        second.join(timeout=2)
-        assert not first.is_alive() and not second.is_alive()
-        assert results == [True, True]
-        assert pool.connection.max_active == 1
-        assert pool.connection.sent == [
+        started = time.monotonic()
+        assert not service._sync_command_to_targets([b"SET", b"key", b"value"])
+        assert time.monotonic() - started < 0.1
+        assert pool.connection.disconnected
+        assert pool.released == []
+
+        deadline = time.monotonic() + 1
+        while not pool.released and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert pool.acquired == [("REPLICATION", pool.connection)]
+        assert pool.released == [pool.connection]
+    finally:
+        service.stop()
+
+
+def test_timed_out_target_is_removed_without_reapplying_healthy_target():
+    healthy, healthy_pool = target_manager()
+    blocked, blocked_pool = target_manager(delay=0.2)
+    service = service_for(
+        targets={"blocked": blocked, "healthy": healthy},
+        config={"target_command_timeout": 0.01},
+    )
+    service.target_failure_callback = service.unregister_target
+    try:
+        assert service._sync_command_to_targets([b"SET", b"key", b"first"])
+        assert list(service.target_connections) == ["healthy"]
+        assert service._sync_command_to_targets([b"SET", b"key", b"second"])
+        assert healthy_pool.connection.sent == [
             (b"SET", b"key", b"first"),
             (b"SET", b"key", b"second"),
         ]
+        assert blocked_pool.connection.sent == [(b"SET", b"key", b"first")]
     finally:
+        service.stop()
+
+
+def test_stop_does_not_wait_for_target_future_that_ignores_disconnect():
+    manager, pool = target_manager()
+    entered = threading.Event()
+    allow_exit = threading.Event()
+
+    def blocked_response():
+        entered.set()
+        allow_exit.wait(2)
+        return b"OK"
+
+    pool.connection.read_response = blocked_response
+    service = service_for(
+        targets={"target": manager},
+        config={"target_command_timeout": 10},
+    )
+    delivery = threading.Thread(
+        target=service._sync_command_to_targets,
+        args=([b"SET", b"key", b"value"],),
+    )
+    delivery.start()
+    assert entered.wait(1)
+
+    started = time.monotonic()
+    service.stop()
+    assert time.monotonic() - started < 0.2
+    delivery.join(timeout=0.2)
+    assert not delivery.is_alive()
+    assert pool.released == []
+
+    allow_exit.set()
+    deadline = time.monotonic() + 1
+    while not pool.released and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert pool.released == [pool.connection]
+
+
+def test_idle_target_stream_connection_is_reaped_without_fd_accumulation():
+    manager, pool = target_manager()
+    service = service_for(
+        targets={"target": manager},
+        config={"target_connection_idle_timeout": 1},
+    )
+    try:
+        assert service._sync_command_to_targets([b"SET", b"key", b"value"])
+        last_used = service._target_connection_last_used["target"]
+        assert service._reap_idle_target_connections(last_used + 2) == 1
+        assert pool.connection.disconnected
+        assert pool.released == [pool.connection]
+        assert service._target_stream_connections == {}
+    finally:
+        service.stop()
+
+
+def test_no_active_target_does_not_commit_and_recovery_retries_cached_state():
+    failing, _failing_pool = target_manager(failures=1)
+    recovered, recovered_pool = target_manager()
+    source = FakeSource({b"key": (b"captured-dump", -1)})
+    service = service_for(
+        source=source,
+        targets={"target": failing},
+        config={"apply_mode": "key_state"},
+    )
+    service.target_failure_callback = service.unregister_target
+    command = [b"SET", b"key", b"value"]
+    try:
+        assert not service._on_command_received(command)
+        assert service.target_connections == {}
+        assert source.pipeline_executions == 1
+
+        service.register_target("target", recovered)
+        assert service._on_command_received(command)
+        assert source.pipeline_executions == 1
+        assert recovered_pool.connection.sent == [
+            (b"RESTORE", b"key", b"0", b"captured-dump", b"REPLACE")
+        ]
+    finally:
+        service.stop()
+
+
+def test_cached_pexpiretime_execabort_retries_capture_with_pttl():
+    class CapabilityPipeline(FakeSourcePipeline):
+        def execute(self):
+            if any(operation == "pexpiretime" for operation, _key in self.operations):
+                self.source.pipeline_executions += 1
+                self.source.pipeline_batches.append(list(self.operations))
+                raise redis.exceptions.ExecAbortError(
+                    "Transaction discarded because of previous errors."
+                )
+            return super().execute()
+
+    class CapabilitySource(FakeSource):
+        def __init__(self):
+            super().__init__({b"key": (b"dump", 60_000)})
+            self.pexpiretimes = {b"key": 1_000_060_000}
+            self.probes = 0
+
+        def execute_command(self, *args):
+            if args and args[0] == "PEXPIRETIME":
+                self.probes += 1
+            return super().execute_command(*args)
+
+        def pipeline(self, transaction=True):
+            assert transaction is True
+            return CapabilityPipeline(self)
+
+    source = CapabilitySource()
+    service = service_for(source=source)
+    service._command_keys = lambda _command: [b"key"]
+    try:
+        operation, states = service._prepare_key_state(
+            [b"SET", b"key", b"value"]
+        )
+        assert operation == "keys"
+        assert states[0][:2] == (b"key", b"dump")
+        assert source.probes == 1
+        assert source.pipeline_executions == 2
+        assert any(
+            operation == "pexpiretime"
+            for operation, _key in source.pipeline_batches[0]
+        )
+        assert all(
+            operation != "pexpiretime"
+            for operation, _key in source.pipeline_batches[1]
+        )
+        assert source._redis_sync_pexpiretime_supported is False
+    finally:
+        service.stop()
+
+
+def test_pexpiretime_response_error_invalidates_cache_and_recaptures():
+    class ResponsePipeline(FakeSourcePipeline):
+        def execute(self):
+            raw = super().execute()
+            for index, (operation, _key) in enumerate(self.operations):
+                if operation == "pexpiretime":
+                    raw[index] = redis.ResponseError(
+                        "NOPERM no permission to run PEXPIRETIME"
+                    )
+            return raw
+
+    class CapabilitySource(FakeSource):
+        def __init__(self):
+            super().__init__({b"key": (b"dump", 60_000)})
+            self.pexpiretimes = {b"key": 1_000_060_000}
+
+        def pipeline(self, transaction=True):
+            assert transaction is True
+            return ResponsePipeline(self)
+
+    source = CapabilitySource()
+    service = service_for(source=source)
+    service._command_keys = lambda _command: [b"key"]
+    try:
+        operation, states = service._prepare_key_state(
+            [b"SET", b"key", b"value"]
+        )
+        assert operation == "keys"
+        assert states[0][:2] == (b"key", b"dump")
+        assert source.pipeline_executions == 2
+        assert source._redis_sync_pexpiretime_supported is False
+    finally:
+        service.stop()
+
+
+def test_positive_pttl_survives_sync_process_wall_clock_skew(monkeypatch):
+    manager, pool = target_manager()
+    source = FakeSource({b"key": (b"dump", 60_000)})
+    source.pexpiretimes = {b"key": 1_000_060_000}
+    monotonic_clock = iter((0, 0))
+    monkeypatch.setattr(
+        unified_incremental_service.time,
+        "monotonic_ns",
+        lambda: next(monotonic_clock),
+    )
+    monkeypatch.setattr(
+        unified_incremental_service.time,
+        "time",
+        lambda: 1_001_000.0,
+    )
+    service = service_for(source=source, targets={"target": manager})
+    try:
+        assert service._on_command_received([b"SET", b"key", b"value"])
+        assert pool.connection.sent == [
+            (
+                b"RESTORE",
+                b"key",
+                b"1000060000",
+                b"dump",
+                b"REPLACE",
+                b"ABSTTL",
+            )
+        ]
+    finally:
+        service.stop()
+
+
+def test_exact_expiry_compatibility_fallback_uses_captured_pttl(monkeypatch):
+    manager, pool = target_manager()
+    source = FakeSource({b"key": (b"dump", 60_000)})
+    source.pexpiretimes = {b"key": 1_000_060_000}
+    service = service_for(source=source, targets={"target": manager})
+    monkeypatch.setattr(
+        unified_incremental_service.time, "monotonic_ns", lambda: 0
+    )
+    monkeypatch.setattr(
+        unified_incremental_service.time, "time", lambda: 1_001_000.0
+    )
+
+    def incompatible_restore():
+        raise redis.ResponseError("ERR DUMP payload version or checksum are wrong")
+
+    fallback_calls = []
+
+    def fallback(_source, _target, key, pttl, preserve_ttl, **options):
+        fallback_calls.append((key, pttl, preserve_ttl, options))
+        return True
+
+    monkeypatch.setattr(pool.connection, "read_response", incompatible_restore)
+    monkeypatch.setattr(unified_incremental_service, "_sync_key_fallback", fallback)
+    try:
+        assert service._on_command_received([b"SET", b"key", b"value"])
+        assert fallback_calls == [
+            (
+                b"key",
+                60_000,
+                True,
+                {
+                    "overwrite": True,
+                    "expires_at_ms": 1_000_060_000,
+                    "expected_dump": b"dump",
+                    "key_types": set(),
+                    "min_ttl": 0,
+                    "max_key_size": 0,
+                    "expires_at_is_exact": True,
+                },
+            )
+        ]
+    finally:
+        service.stop()
+
+
+def test_replication_status_marks_callback_waiting_on_barrier_as_stalled():
+    manager, _pool = target_manager()
+    source = FakeSource({b"key": (b"dump", -1)})
+    service = service_for(
+        source=source,
+        targets={"target": manager},
+        config={"target_command_timeout": 0.01},
+    )
+    service.handler = SimpleNamespace(
+        running=True,
+        last_error=None,
+        replication_id="replid",
+        replication_offset=0,
+        received_offset=0,
+    )
+    delivery = None
+    try:
+        with service.command_barrier():
+            delivery = threading.Thread(
+                target=service._on_command_received,
+                args=([b"SET", b"key", b"value"],),
+            )
+            delivery.start()
+            deadline = time.monotonic() + 1
+            status = service.get_replication_status()
+            while not status["callback_in_flight"] and time.monotonic() < deadline:
+                time.sleep(0.001)
+                status = service.get_replication_status()
+            time.sleep(0.02)
+            status = service.get_replication_status()
+            assert status["callback_in_flight"] is True
+            assert status["stalled"] is True
+            assert status["healthy"] is False
+        delivery.join(timeout=1)
+        assert not delivery.is_alive()
+        assert service.get_replication_status()["healthy"] is True
+    finally:
+        if delivery is not None:
+            delivery.join(timeout=1)
+        service.stop()
+
+
+def test_replication_status_marks_blocked_fullresync_snapshot_unhealthy():
+    manager, _pool = target_manager()
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+
+    def apply_snapshot(_rdb_data):
+        callback_entered.set()
+        assert release_callback.wait(1)
+        return True
+
+    service = service_for(
+        targets={"target": manager},
+        config={
+            "snapshot_callback": apply_snapshot,
+            "target_command_timeout": 0.01,
+        },
+    )
+    service.handler = SimpleNamespace(
+        running=True,
+        last_error=None,
+        replication_id=None,
+        replication_offset=-1,
+        received_offset=-1,
+    )
+    worker = threading.Thread(
+        target=service._snapshot_callback,
+        args=(b"rdb",),
+    )
+    try:
+        worker.start()
+        assert callback_entered.wait(1)
+        time.sleep(0.02)
+
+        status = service.get_replication_status()
+
+        assert status["baseline_established"] is False
+        assert status["callback_in_flight"] is True
+        assert status["stalled"] is True
+        assert status["healthy"] is False
+    finally:
+        release_callback.set()
+        worker.join(timeout=1)
         service.stop()

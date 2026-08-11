@@ -1,5 +1,10 @@
 import base64
 import json
+import socket
+import threading
+import time
+from http.server import ThreadingHTTPServer
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -16,7 +21,7 @@ from redis_sync.config import (
     load_config,
 )
 from redis_sync.exceptions import ConfigurationError
-from redis_sync.web_ui import WebUIHandler
+from redis_sync.web_ui import WebUI, WebUIHandler, _ConcurrentHTTPServer
 
 
 def _make_web_handler(config, client_ip='127.0.0.1', headers=None, path='/api/status'):
@@ -177,6 +182,178 @@ def test_reload_endpoint_reports_not_implemented():
 
     assert responses[0][0] == 501
     assert json.loads(responses[0][1])['success'] is False
+
+
+def test_web_server_partial_request_does_not_block_api_or_shutdown():
+    service = SimpleNamespace(
+        config={},
+        start_time=time.time(),
+        get_status=lambda: {'running': True, 'targets': {}},
+    )
+    web_ui = WebUI(
+        service,
+        host='127.0.0.1',
+        port=0,
+        request_timeout=0.5,
+    )
+    stalled_client = None
+
+    try:
+        web_ui.start()
+        address = web_ui.server.server_address
+        stalled_client = socket.create_connection(address, timeout=1)
+        stalled_client.sendall(b'GET /api/status HTTP/1.1\r\nHost: localhost\r\n')
+
+        with socket.create_connection(address, timeout=1) as healthy_client:
+            healthy_client.sendall(
+                b'GET /api/status HTTP/1.1\r\n'
+                b'Host: localhost\r\n'
+                b'Connection: close\r\n\r\n'
+            )
+            response = b''
+            while True:
+                chunk = healthy_client.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+
+        assert response.startswith(b'HTTP/1.0 200 OK')
+        assert b'"running": true' in response
+
+        started_at = time.monotonic()
+        web_ui.stop()
+        assert time.monotonic() - started_at < 2
+    finally:
+        if stalled_client is not None:
+            stalled_client.close()
+        web_ui.stop()
+
+
+def test_web_ui_stop_uses_one_deadline_and_tracks_all_shutdown_threads(capsys):
+    shutdown_started = threading.Event()
+    shutdown_release = threading.Event()
+    close_started = threading.Event()
+    close_release = threading.Event()
+    server_thread_release = threading.Event()
+    shutdown_calls = []
+    close_calls = []
+
+    class BlockingServer:
+        def shutdown(self):
+            shutdown_calls.append(True)
+            shutdown_started.set()
+            shutdown_release.wait()
+
+        def server_close(self):
+            close_calls.append(True)
+            close_started.set()
+            close_release.wait()
+
+    server_thread = threading.Thread(
+        target=server_thread_release.wait,
+        daemon=True,
+    )
+    server_thread.start()
+    web_ui = WebUI(object())
+    web_ui.server = BlockingServer()
+    web_ui.server_thread = server_thread
+
+    try:
+        started_at = time.monotonic()
+        assert web_ui.stop(timeout=0) is False
+        assert time.monotonic() - started_at < 0.1
+        assert capsys.readouterr().out == "Web UI停止未完成\n"
+        assert shutdown_started.wait(1)
+        assert close_started.wait(1)
+
+        shutdown_release.set()
+        assert web_ui.stop(timeout=0.1) is False
+        assert shutdown_calls == [True]
+        assert close_calls == [True]
+
+        close_release.set()
+        assert web_ui.stop(timeout=0.1) is False
+
+        server_thread_release.set()
+        capsys.readouterr()
+        assert web_ui.stop(timeout=1) is True
+        assert capsys.readouterr().out == "Web UI已停止\n"
+        assert web_ui.server is None
+        assert web_ui.server_thread is None
+        assert web_ui.stop(timeout=0) is True
+    finally:
+        shutdown_release.set()
+        close_release.set()
+        server_thread_release.set()
+        server_thread.join(timeout=1)
+
+
+def test_web_ui_stop_before_start_is_idempotent():
+    web_ui = WebUI(object())
+
+    assert web_ui.stop(timeout=0) is True
+    assert web_ui.stop(timeout=0) is True
+
+
+def test_web_server_rejects_requests_above_concurrency_limit(monkeypatch):
+    accepted = []
+
+    class FakeRequest:
+        def __init__(self):
+            self.sent = b''
+            self.closed = False
+
+        def sendall(self, payload):
+            self.sent += payload
+
+        def shutdown(self, _how):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(
+        ThreadingHTTPServer,
+        'process_request',
+        lambda _server, request, _address: accepted.append(request),
+    )
+    server = _ConcurrentHTTPServer(
+        ('127.0.0.1', 0),
+        WebUIHandler,
+        max_workers=1,
+        bind_and_activate=False,
+    )
+    first = FakeRequest()
+    overloaded = FakeRequest()
+
+    try:
+        server.process_request(first, ('127.0.0.1', 10001))
+        server.process_request(overloaded, ('127.0.0.1', 10002))
+
+        assert accepted == [first]
+        assert overloaded.sent.startswith(
+            b'HTTP/1.1 503 Service Unavailable'
+        )
+        assert overloaded.closed is True
+    finally:
+        server._request_slots.release()
+        server.server_close()
+
+
+def test_web_dashboard_uses_composite_service_health():
+    script = object.__new__(WebUIHandler)._get_javascript()
+
+    assert "status.running && status.healthy === true" in script
+    assert "statusDot.className = 'status-dot degraded'" in script
+    assert "statusText.textContent = '运行异常'" in script
+
+
+def test_systemd_unit_restarts_after_clean_internal_exit():
+    unit_path = Path(__file__).resolve().parents[1] / 'redis-sync.service'
+    unit = unit_path.read_text(encoding='utf-8')
+
+    assert 'Restart=always' in unit
+    assert 'Restart=on-failure' not in unit
 
 
 class _FakeRedisClient:

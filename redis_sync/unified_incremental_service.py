@@ -17,6 +17,9 @@ from .key_sync import (
     _is_absttl_compatibility_error,
     _is_restore_compatibility_error,
     _sync_key_fallback,
+    cache_source_pexpiretime_support,
+    capture_dump_with_preflight,
+    is_pexpiretime_capability_error,
     restore_dump_with_deadline,
     source_supports_pexpiretime,
 )
@@ -27,6 +30,7 @@ from .sync_handler import SyncHandler
 
 logger = logging.getLogger(__name__)
 MAX_PIPELINE_KEYS = 200
+DEFAULT_TARGET_CONNECTION_IDLE_TIMEOUT = 60.0
 
 
 def _bounded_pipeline_batch_size(value) -> int:
@@ -83,6 +87,7 @@ class UnifiedIncrementalService:
         self._stopped = False
 
         self._stats_lock = threading.Lock()
+        self._replication_state_lock = threading.Lock()
         self._command_lock = threading.RLock()
         self._delivery_lock = threading.Lock()
         self.stats = {
@@ -108,6 +113,15 @@ class UnifiedIncrementalService:
         self.target_command_timeout = float(
             config.get("target_command_timeout", 5) or 5
         )
+        self.target_connection_idle_timeout = float(
+            config.get(
+                "target_connection_idle_timeout",
+                DEFAULT_TARGET_CONNECTION_IDLE_TIMEOUT,
+            )
+            or DEFAULT_TARGET_CONNECTION_IDLE_TIMEOUT
+        )
+        if self.target_connection_idle_timeout <= 0:
+            raise ValueError("target_connection_idle_timeout must be positive")
         self.apply_mode = str(config.get("apply_mode", "key_state")).lower()
         if self.apply_mode not in {"direct", "key_state"}:
             raise ValueError(f"unsupported replication apply_mode: {self.apply_mode}")
@@ -196,7 +210,12 @@ class UnifiedIncrementalService:
         }
         self._target_stream_connections: Dict[str, Any] = {}
         self._target_connection_db: Dict[str, int] = {}
+        self._target_connection_last_used: Dict[str, float] = {}
+        self._target_connections_in_use: Set[str] = set()
+        self._target_inflight_futures: Dict[str, Any] = {}
+        self._cancelled_targets: Set[str] = set()
         self._target_connections_lock = threading.Lock()
+        self._connection_reaper_thread: Optional[threading.Thread] = None
         self._source_command_connections: Dict[int, Any] = {}
         self._source_command_connections_lock = threading.Lock()
 
@@ -206,6 +225,12 @@ class UnifiedIncrementalService:
         self._pending_delivery_key: Optional[Tuple[int, Tuple[bytes, ...]]] = None
         self._pending_delivery_success: Set[str] = set()
         self._pending_prepared_state = None
+
+        self._callback_count = 0
+        self._callback_started_at: Optional[float] = None
+        self._callback_started_monotonic: Optional[float] = None
+        self._last_progress_time: Optional[float] = None
+        self._last_callback_error: Optional[str] = None
 
     @staticmethod
     def _compile_patterns(patterns) -> List[bytes]:
@@ -223,6 +248,7 @@ class UnifiedIncrementalService:
                 return True
             self.running = True
             self.shutdown_event.clear()
+            self._start_target_connection_reaper()
         with self._stats_lock:
             self.stats["start_time"] = time.time()
 
@@ -234,32 +260,59 @@ class UnifiedIncrementalService:
             self._start_psync_mode()
         return not self._stopped
 
-    def stop(self):
+    def stop(self, timeout: float = 1.0) -> bool:
         with self._lifecycle_lock:
             if self._stopped:
-                return
+                return self.wait_stopped(0)
             self._stopped = True
             self.running = False
             self.shutdown_event.set()
             handler = self.handler
-        interrupted = self._interrupt_target_stream_connections()
+        self._interrupt_target_stream_connections()
         self._interrupt_source_command_connections()
+        handler_stopped = True
         if handler and hasattr(handler, "stop_replication"):
-            handler.stop_replication()
-        self.executor.shutdown(wait=True)
-        self._release_interrupted_target_connections(interrupted)
-        self._close_target_stream_connections()
+            try:
+                result = handler.stop_replication(timeout=timeout)
+            except TypeError:
+                result = handler.stop_replication()
+            handler_stopped = result is not False
+        try:
+            self.executor.shutdown(wait=False, cancel_futures=True)
+        except TypeError:  # Python 3.7/3.8 compatibility
+            self.executor.shutdown(wait=False)
         self._print_stats()
+        return handler_stopped and self.wait_stopped(0)
+
+    def wait_stopped(self, timeout: float = 10.0) -> bool:
+        handler = self.handler
+        if handler is None:
+            return True
+        wait_callback = getattr(handler, "wait_stopped", None)
+        if callable(wait_callback):
+            return bool(wait_callback(timeout))
+        thread = getattr(handler, "replication_thread", None)
+        if thread is None:
+            return True
+        if thread is threading.current_thread():
+            return False
+        thread.join(timeout=max(0.0, float(timeout)))
+        return not thread.is_alive()
 
     def _snapshot_callback(self, rdb_data: bytes) -> bool:
-        callback = self.config.get("snapshot_callback")
-        if not callable(callback):
-            logger.error(
-                "FULLRESYNC requires config['snapshot_callback']; snapshot retained as failure"
-            )
-            return False
-        with self._command_lock:
-            try:
+        self._begin_replication_callback()
+        succeeded = False
+        failure_message = "replication snapshot callback reported failure"
+        try:
+            callback = self.config.get("snapshot_callback")
+            if not callable(callback):
+                failure_message = (
+                    "FULLRESYNC requires config['snapshot_callback']; "
+                    "snapshot retained as failure"
+                )
+                logger.error(failure_message)
+                return False
+            with self._command_lock:
                 result = callback(rdb_data) is not False
                 if result:
                     self._selected_db = 0
@@ -267,10 +320,14 @@ class UnifiedIncrementalService:
                         self._pending_delivery_key = None
                         self._pending_delivery_success.clear()
                         self._pending_prepared_state = None
+                    succeeded = True
                 return result
-            except Exception as exc:
-                logger.error("snapshot callback failed: %s", exc, exc_info=True)
-                return False
+        except Exception as exc:
+            failure_message = str(exc)
+            logger.error("snapshot callback failed: %s", exc, exc_info=True)
+            return False
+        finally:
+            self._finish_replication_callback(succeeded, failure_message)
 
     def _start_sync_mode(self):
         target_client = next(
@@ -336,6 +393,44 @@ class UnifiedIncrementalService:
                 break
 
     def _on_command_received(self, command: List[bytes]) -> bool:
+        """Track callback progress and commit only after every target succeeds."""
+        self._begin_replication_callback()
+        delivered = False
+        failure_message = "replication command callback reported failure"
+        try:
+            delivered = self._process_command_received(command)
+            return delivered
+        except Exception as exc:
+            failure_message = str(exc)
+            raise
+        finally:
+            self._finish_replication_callback(delivered, failure_message)
+
+    def _begin_replication_callback(self) -> None:
+        """Start timing before a callback waits on the ordered command barrier."""
+        started_at = time.time()
+        started_monotonic = time.monotonic()
+        with self._replication_state_lock:
+            if self._callback_count == 0:
+                self._callback_started_at = started_at
+                self._callback_started_monotonic = started_monotonic
+            self._callback_count += 1
+
+    def _finish_replication_callback(
+        self, succeeded: bool, failure_message: str
+    ) -> None:
+        with self._replication_state_lock:
+            if succeeded:
+                self._last_progress_time = time.time()
+                self._last_callback_error = None
+            else:
+                self._last_callback_error = failure_message
+            self._callback_count = max(0, self._callback_count - 1)
+            if self._callback_count == 0:
+                self._callback_started_at = None
+                self._callback_started_monotonic = None
+
+    def _process_command_received(self, command: List[bytes]) -> bool:
         """Return true only after every target has committed this command."""
 
         with self._command_lock:
@@ -474,15 +569,22 @@ class UnifiedIncrementalService:
         with self._command_lock:
             self.target_connections[target_name] = target_conn
             self._target_locks.setdefault(target_name, threading.Lock())
+            with self._target_connections_lock:
+                self._cancelled_targets.discard(target_name)
+            with self._delivery_lock:
+                # A recovered target with the same name is a new delivery
+                # endpoint. It must acknowledge the pending frame itself.
+                self._pending_delivery_success.discard(target_name)
 
     def unregister_target(self, target_name: str):
         """Remove a failed target from active fan-out and close its stream socket."""
         with self._command_lock:
             target_conn = self.target_connections.pop(target_name, None)
             if target_conn is not None:
-                lock = self._target_locks.setdefault(target_name, threading.Lock())
-                with lock:
-                    self._drop_target_stream_connection(target_name, target_conn)
+                self._interrupt_target_stream_connection(
+                    target_name,
+                    target_conn=target_conn,
+                )
             return target_conn
 
     def _delivery_identity(self, command: List[bytes]):
@@ -511,9 +613,11 @@ class UnifiedIncrementalService:
 
     def _complete_delivery(self, identity) -> bool:
         with self._delivery_lock:
+            active_names = set(self.target_connections)
             complete = (
                 self._pending_delivery_key == identity
-                and len(self._pending_delivery_success) == len(self.target_connections)
+                and bool(active_names)
+                and active_names.issubset(self._pending_delivery_success)
             )
             if complete:
                 self._pending_delivery_key = None
@@ -525,36 +629,76 @@ class UnifiedIncrementalService:
             self.stats["commands_failed"] += 1
         return False
 
-    def _wait_target_future(self, target_name: str, future) -> bool:
-        try:
-            return future.result(timeout=self.target_command_timeout) is not False
-        except FuturesTimeoutError:
-            logger.error(
-                "target %s exceeded %.1fs; waiting for the in-flight command before continuing",
-                target_name,
-                self.target_command_timeout,
-            )
-            if future.cancel():
+    def _wait_target_future(
+        self,
+        target_name: str,
+        future,
+        submitted_at: float,
+    ) -> bool:
+        deadline = submitted_at + self.target_command_timeout
+        while True:
+            if future.done():
+                try:
+                    return future.result() is not False
+                except Exception as exc:
+                    logger.error("target %s command failed: %s", target_name, exc)
+                    return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or self.shutdown_event.is_set():
+                reason = (
+                    "service shutdown"
+                    if self.shutdown_event.is_set()
+                    else f"{self.target_command_timeout:.1f}s deadline"
+                )
+                logger.error(
+                    "target %s interrupted after %s",
+                    target_name,
+                    reason,
+                )
+                self._interrupt_target_stream_connection(
+                    target_name,
+                    future=future,
+                )
+                future.cancel()
                 return False
             try:
-                return future.result() is not False
+                return future.result(timeout=min(0.05, remaining)) is not False
+            except FuturesTimeoutError:
+                continue
             except Exception as exc:
-                logger.error("target %s command failed after timeout: %s", target_name, exc)
+                logger.error("target %s command failed: %s", target_name, exc)
                 return False
-        except Exception as exc:
-            logger.error("target %s command failed: %s", target_name, exc)
-            return False
 
     def _fan_out(self, identity, remaining, function, *args) -> bool:
-        futures = {
-            name: self.executor.submit(
-                function, name, self.target_connections[name], *args
+        futures = {}
+        for name in remaining:
+            start_gate = threading.Event()
+
+            def run_registered_target(
+                target_name=name,
+                target_conn=self.target_connections[name],
+                gate=start_gate,
+            ):
+                gate.wait()
+                return function(target_name, target_conn, *args)
+
+            submitted_at = time.monotonic()
+            future = self.executor.submit(run_registered_target)
+            futures[name] = (future, submitted_at)
+            with self._target_connections_lock:
+                self._target_inflight_futures[name] = future
+            future.add_done_callback(
+                lambda completed, target=name: self._finish_target_future(
+                    target, completed
+                )
             )
-            for name in remaining
-        }
+            # A worker may acquire its raw connection immediately. Publish the
+            # owning future first so stop/timeout always defer pool release
+            # until that worker has actually finished with the connection.
+            start_gate.set()
         failed_targets = []
-        for target_name, future in futures.items():
-            if self._wait_target_future(target_name, future):
+        for target_name, (future, submitted_at) in futures.items():
+            if self._wait_target_future(target_name, future, submitted_at):
                 self._finish_target_delivery(identity, target_name)
                 callback = self.target_success_callback
                 if callable(callback):
@@ -673,6 +817,132 @@ class UnifiedIncrementalService:
                 except Exception:
                     pass
 
+    def _capture_key_states(self, keys: List[bytes], has_pexpiretime: bool):
+        states = []
+        stride = (
+            2
+            + bool(has_pexpiretime)
+            + bool(self.key_types)
+            + bool(self.filter_max_key_size > 0)
+        )
+        try:
+            for offset in range(0, len(keys), self.pipeline_batch_size):
+                chunk = keys[offset:offset + self.pipeline_batch_size]
+                pipeline = self.source_client.pipeline(transaction=True)
+                for key in chunk:
+                    pipeline.dump(key)
+                    pipeline.pttl(key)
+                    if has_pexpiretime:
+                        pipeline.execute_command("PEXPIRETIME", key)
+                    if self.key_types:
+                        pipeline.type(key)
+                    if self.filter_max_key_size > 0:
+                        pipeline.execute_command("MEMORY", "USAGE", key)
+                pttl_sample_started_ns = time.monotonic_ns()
+                raw = pipeline.execute()
+                observed_at_ms = int(time.time() * 1000)
+                elapsed_ms = (
+                    max(0, time.monotonic_ns() - pttl_sample_started_ns)
+                    + 999_999
+                ) // 1_000_000
+                for index, key in enumerate(chunk):
+                    base = index * stride
+                    dump_value = raw[base]
+                    ttl_value = raw[base + 1]
+                    expiry_value = raw[base + 2] if has_pexpiretime else None
+                    next_index = base + 2 + bool(has_pexpiretime)
+                    key_type = raw[next_index] if self.key_types else None
+                    next_index += bool(self.key_types)
+                    memory_size = (
+                        raw[next_index]
+                        if self.filter_max_key_size > 0
+                        else None
+                    )
+                    if isinstance(expiry_value, BaseException):
+                        if (
+                            has_pexpiretime
+                            and isinstance(expiry_value, redis.ResponseError)
+                        ):
+                            cache_source_pexpiretime_support(
+                                self.source_client, False
+                            )
+                            return self._capture_key_states(keys, False)
+                        raise expiry_value
+                    for value in (
+                        dump_value,
+                        ttl_value,
+                        key_type,
+                        memory_size,
+                    ):
+                        if isinstance(value, BaseException):
+                            raise value
+                    ttl = int(ttl_value)
+                    if dump_value is None or ttl in (-2, 0):
+                        states.append((key, None, None, None, False))
+                        continue
+                    if ttl < -2:
+                        raise ValueError(
+                            f"invalid PTTL response for {key!r}: {ttl}"
+                        )
+                    expires_at_ms = None
+                    remaining_ttl_ms = ttl
+                    if ttl > 0:
+                        remaining_ttl_ms = ttl - elapsed_ms
+                        if remaining_ttl_ms <= 0:
+                            states.append((key, None, None, None, False))
+                            continue
+                        try:
+                            absolute_ms = int(expiry_value)
+                        except (TypeError, ValueError):
+                            absolute_ms = -1
+                        if absolute_ms > 0:
+                            # The source absolute deadline is transferred as-is,
+                            # but source liveness is determined by PTTL only.
+                            expires_at_ms = absolute_ms
+                            expiry_is_exact = True
+                        else:
+                            expires_at_ms = observed_at_ms + remaining_ttl_ms
+                            expiry_is_exact = False
+                    else:
+                        expiry_is_exact = False
+                    if self.key_types:
+                        normalized_type = (
+                            key_type.decode("ascii", errors="replace").lower()
+                            if isinstance(key_type, bytes)
+                            else str(key_type).lower()
+                        )
+                        if normalized_type not in self.key_types:
+                            states.append((key, None, None, None, False))
+                            continue
+                    if (
+                        self.filter_min_ttl > 0
+                        and 0 < remaining_ttl_ms < self.filter_min_ttl * 1000
+                    ):
+                        states.append((key, None, None, None, False))
+                        continue
+                    if (
+                        self.filter_max_key_size > 0
+                        and memory_size is not None
+                        and int(memory_size) > self.filter_max_key_size
+                    ):
+                        states.append((key, None, None, None, False))
+                        continue
+                    states.append(
+                        (
+                            key,
+                            dump_value,
+                            expires_at_ms,
+                            remaining_ttl_ms,
+                            expiry_is_exact,
+                        )
+                    )
+        except Exception as error:
+            if has_pexpiretime and is_pexpiretime_capability_error(error):
+                cache_source_pexpiretime_support(self.source_client, False)
+                return self._capture_key_states(keys, False)
+            raise
+        return states
+
     def _prepare_key_state(self, command: List[bytes]):
         cmd_name = command[0].decode("utf-8", errors="replace").upper()
         if cmd_name in {"MULTI", "EXEC", "DISCARD"}:
@@ -692,98 +962,35 @@ class UnifiedIncrementalService:
         keys = [key for key in keys if self._key_allowed(key)]
         if not keys:
             return "noop", []
+        if self.filter_max_key_size > 0:
+            states = []
+            for key in keys:
+                captured = capture_dump_with_preflight(
+                    self.source_client,
+                    key,
+                    preserve_ttl=True,
+                    key_types=self.key_types,
+                    min_ttl=self.filter_min_ttl,
+                    max_key_size=self.filter_max_key_size,
+                )
+                if captured is None:
+                    states.append((key, None, None, None, False))
+                else:
+                    states.append(
+                        (
+                            key,
+                            captured.dump_data,
+                            captured.expires_at_ms,
+                            captured.remaining_ttl_ms,
+                            captured.expiry_is_exact,
+                        )
+                    )
+            return "keys", states
         has_pexpiretime = source_supports_pexpiretime(
             self.source_client,
             keys[0],
         )
-        states = []
-        stride = (
-            2
-            + bool(has_pexpiretime)
-            + bool(self.key_types)
-            + bool(self.filter_max_key_size > 0)
-        )
-        for offset in range(0, len(keys), self.pipeline_batch_size):
-            chunk = keys[offset:offset + self.pipeline_batch_size]
-            pipeline = self.source_client.pipeline(transaction=True)
-            for key in chunk:
-                pipeline.dump(key)
-                pipeline.pttl(key)
-                if has_pexpiretime:
-                    pipeline.execute_command("PEXPIRETIME", key)
-                if self.key_types:
-                    pipeline.type(key)
-                if self.filter_max_key_size > 0:
-                    pipeline.execute_command("MEMORY", "USAGE", key)
-            pttl_sample_started_ns = time.monotonic_ns()
-            raw = pipeline.execute()
-            observed_at_ms = int(time.time() * 1000)
-            elapsed_ms = (
-                max(0, time.monotonic_ns() - pttl_sample_started_ns) + 999_999
-            ) // 1_000_000
-            for index, key in enumerate(chunk):
-                base = index * stride
-                dump_value = raw[base]
-                ttl_value = raw[base + 1]
-                expiry_value = raw[base + 2] if has_pexpiretime else None
-                next_index = base + 2 + bool(has_pexpiretime)
-                key_type = raw[next_index] if self.key_types else None
-                next_index += bool(self.key_types)
-                memory_size = raw[next_index] if self.filter_max_key_size > 0 else None
-                for value in (
-                    dump_value,
-                    ttl_value,
-                    key_type,
-                    memory_size,
-                ):
-                    if isinstance(value, BaseException):
-                        raise value
-                ttl = int(ttl_value)
-                if dump_value is None or ttl in (-2, 0):
-                    states.append((key, None, None))
-                    continue
-                if ttl < -2:
-                    raise ValueError(f"invalid PTTL response for {key!r}: {ttl}")
-                expires_at_ms = None
-                remaining_ttl_ms = ttl
-                if ttl > 0:
-                    try:
-                        absolute_ms = int(expiry_value)
-                    except (TypeError, ValueError):
-                        absolute_ms = -1
-                    if absolute_ms > 0:
-                        expires_at_ms = absolute_ms
-                        remaining_ttl_ms = absolute_ms - observed_at_ms
-                    else:
-                        remaining_ttl_ms = ttl - elapsed_ms
-                        expires_at_ms = observed_at_ms + remaining_ttl_ms
-                    if remaining_ttl_ms <= 0:
-                        states.append((key, None, None))
-                        continue
-                if self.key_types:
-                    normalized_type = (
-                        key_type.decode("ascii", errors="replace").lower()
-                        if isinstance(key_type, bytes)
-                        else str(key_type).lower()
-                    )
-                    if normalized_type not in self.key_types:
-                        states.append((key, None, None))
-                        continue
-                if (
-                    self.filter_min_ttl > 0
-                    and 0 < remaining_ttl_ms < self.filter_min_ttl * 1000
-                ):
-                    states.append((key, None, None))
-                    continue
-                if (
-                    self.filter_max_key_size > 0
-                    and memory_size is not None
-                    and int(memory_size) > self.filter_max_key_size
-                ):
-                    states.append((key, None, None))
-                    continue
-                states.append((key, dump_value, expires_at_ms))
-        return "keys", states
+        return "keys", self._capture_key_states(keys, has_pexpiretime)
 
     def _sync_key_state_to_targets(self, command: List[bytes]) -> bool:
         identity, remaining = self._begin_delivery(command)
@@ -833,19 +1040,61 @@ class UnifiedIncrementalService:
         with self._target_connections_lock:
             if self.shutdown_event.is_set() or not self.running:
                 raise RuntimeError("replication service is stopping")
+            if (
+                target_name in self._cancelled_targets
+                or self.target_connections.get(target_name) is not target_conn
+            ):
+                raise RuntimeError(f"target {target_name} is no longer active")
             connection = self._target_stream_connections.get(target_name)
             if connection is not None:
                 return connection
-            pool = target_conn.target_client.connection_pool
-            connection = pool.get_connection("REPLICATION")
+        pool = target_conn.target_client.connection_pool
+        connection = pool.get_connection("REPLICATION")
+        with self._target_connections_lock:
+            if (
+                self.shutdown_event.is_set()
+                or not self.running
+                or target_name in self._cancelled_targets
+                or self.target_connections.get(target_name) is not target_conn
+            ):
+                try:
+                    connection.disconnect()
+                except Exception:
+                    pass
+                try:
+                    pool.release(connection)
+                except Exception:
+                    pass
+                raise RuntimeError(f"target {target_name} is no longer active")
+            existing = self._target_stream_connections.get(target_name)
+            if existing is not None:
+                try:
+                    pool.release(connection)
+                except Exception:
+                    pass
+                return existing
             self._target_stream_connections[target_name] = connection
             self._target_connection_db[target_name] = self._target_base_db(target_conn)
+            self._target_connection_last_used[target_name] = time.monotonic()
             return connection
+
+    @contextmanager
+    def _target_connection_activity(self, target_name: str):
+        with self._target_connections_lock:
+            self._target_connections_in_use.add(target_name)
+        try:
+            yield
+        finally:
+            with self._target_connections_lock:
+                self._target_connections_in_use.discard(target_name)
+                if target_name in self._target_stream_connections:
+                    self._target_connection_last_used[target_name] = time.monotonic()
 
     def _drop_target_stream_connection(self, target_name, target_conn) -> None:
         with self._target_connections_lock:
             connection = self._target_stream_connections.pop(target_name, None)
             self._target_connection_db.pop(target_name, None)
+            self._target_connection_last_used.pop(target_name, None)
         if connection is None:
             return
         try:
@@ -893,21 +1142,22 @@ class UnifiedIncrementalService:
     ) -> bool:
         lock = self._target_locks[target_name]
         with lock:
-            try:
-                if not target_conn or not target_conn.target_client:
+            with self._target_connection_activity(target_name):
+                try:
+                    if not target_conn or not target_conn.target_client:
+                        return False
+                    connection = self._get_target_stream_connection(target_name, target_conn)
+                    cmd_name = command[0].upper()
+                    if cmd_name != b"SELECT":
+                        self._select_target_db(target_name, connection, selected_db)
+                    response = self._send_target_command(connection, command)
+                    if cmd_name == b"SELECT":
+                        self._target_connection_db[target_name] = int(command[1])
+                    return not isinstance(response, BaseException)
+                except Exception as exc:
+                    logger.error("target %s execution failed: %s", target_name, exc)
+                    self._drop_target_stream_connection(target_name, target_conn)
                     return False
-                connection = self._get_target_stream_connection(target_name, target_conn)
-                cmd_name = command[0].upper()
-                if cmd_name != b"SELECT":
-                    self._select_target_db(target_name, connection, selected_db)
-                response = self._send_target_command(connection, command)
-                if cmd_name == b"SELECT":
-                    self._target_connection_db[target_name] = int(command[1])
-                return not isinstance(response, BaseException)
-            except Exception as exc:
-                logger.error("target %s execution failed: %s", target_name, exc)
-                self._drop_target_stream_connection(target_name, target_conn)
-                return False
 
     def _apply_key_state_to_target(
         self,
@@ -918,103 +1168,121 @@ class UnifiedIncrementalService:
     ) -> bool:
         lock = self._target_locks[target_name]
         with lock:
-            try:
-                if not target_conn or not target_conn.target_client:
-                    return False
-                connection = self._get_target_stream_connection(target_name, target_conn)
-                target_db = self._target_base_db(target_conn)
-                self._select_target_db(target_name, connection, target_db)
-                if operation == "flushdb":
-                    self._flush_target_scope(connection, target_conn)
-                    return True
-                for key, dump_value, expires_at_ms in states:
-                    if dump_value is None:
-                        self._delete_target_key_in_scope(connection, key)
-                    else:
-                        if expires_at_ms is None:
-                            restore_command = [
-                                b"RESTORE",
-                                key,
-                                b"0",
-                                dump_value,
-                                b"REPLACE",
-                            ]
+            with self._target_connection_activity(target_name):
+                try:
+                    if not target_conn or not target_conn.target_client:
+                        return False
+                    connection = self._get_target_stream_connection(target_name, target_conn)
+                    target_db = self._target_base_db(target_conn)
+                    self._select_target_db(target_name, connection, target_db)
+                    if operation == "flushdb":
+                        self._flush_target_scope(connection, target_conn)
+                        return True
+                    for state in states:
+                        key, dump_value, expires_at_ms = state[:3]
+                        if len(state) >= 5:
+                            remaining_ttl_ms = state[3]
+                            expiry_is_exact = bool(state[4])
                         else:
-                            if expires_at_ms <= int(time.time() * 1000):
-                                self._delete_target_key_in_scope(connection, key)
-                                continue
-                            restore_command = [
-                                b"RESTORE",
-                                key,
-                                str(expires_at_ms).encode("ascii"),
-                                dump_value,
-                                b"REPLACE",
-                                b"ABSTTL",
-                            ]
-                        try:
-                            self._send_target_command(
-                                connection,
-                                restore_command,
+                            remaining_ttl_ms = None
+                            expiry_is_exact = (
+                                bool(state[3]) if len(state) == 4 else False
                             )
-                        except redis.ResponseError as exc:
-                            if (
-                                expires_at_ms is not None
-                                and _is_absttl_compatibility_error(exc)
-                            ):
-                                try:
-                                    restored = restore_dump_with_deadline(
-                                        target_conn.target_client,
-                                        key,
-                                        dump_value,
-                                        expires_at_ms,
-                                        overwrite=True,
-                                        prefer_absttl=False,
-                                    )
-                                except redis.ResponseError as legacy_exc:
-                                    exc = legacy_exc
-                                else:
-                                    if not restored:
-                                        raise RuntimeError(
-                                            f"legacy RESTORE skipped key {key!r}"
+                        if dump_value is None:
+                            self._delete_target_key_in_scope(connection, key)
+                        elif expires_at_ms is not None and expires_at_ms <= 0:
+                            self._delete_target_key_in_scope(connection, key)
+                        else:
+                            if expires_at_ms is None:
+                                restore_command = [
+                                    b"RESTORE",
+                                    key,
+                                    b"0",
+                                    dump_value,
+                                    b"REPLACE",
+                                ]
+                            else:
+                                # Redis evaluates ABSTTL against its own clock.
+                                # A skewed sync-process clock must not pre-delete
+                                # a source key whose sampled PTTL was positive.
+                                restore_command = [
+                                    b"RESTORE",
+                                    key,
+                                    str(expires_at_ms).encode("ascii"),
+                                    dump_value,
+                                    b"REPLACE",
+                                    b"ABSTTL",
+                                ]
+                            try:
+                                self._send_target_command(
+                                    connection,
+                                    restore_command,
+                                )
+                            except redis.ResponseError as exc:
+                                if (
+                                    expires_at_ms is not None
+                                    and _is_absttl_compatibility_error(exc)
+                                ):
+                                    try:
+                                        restored = restore_dump_with_deadline(
+                                            target_conn.target_client,
+                                            key,
+                                            dump_value,
+                                            expires_at_ms,
+                                            overwrite=True,
+                                            prefer_absttl=False,
+                                            expires_at_is_exact=expiry_is_exact,
                                         )
-                                    continue
-                            if not _is_restore_compatibility_error(exc):
-                                raise
-                            logger.warning(
-                                "target %s RESTORE compatibility fallback for key=%r: %s",
-                                target_name,
-                                key,
-                                exc,
-                            )
-                            fallback_pttl = (
-                                -1
-                                if expires_at_ms is None
-                                else max(
-                                    1,
-                                    expires_at_ms - int(time.time() * 1000),
+                                    except redis.ResponseError as legacy_exc:
+                                        exc = legacy_exc
+                                    else:
+                                        if not restored:
+                                            raise RuntimeError(
+                                                f"legacy RESTORE skipped key {key!r}"
+                                            )
+                                        continue
+                                if not _is_restore_compatibility_error(exc):
+                                    raise
+                                logger.warning(
+                                    "target %s RESTORE compatibility fallback for key=%r: %s",
+                                    target_name,
+                                    key,
+                                    exc,
                                 )
-                            )
-                            if not _sync_key_fallback(
-                                self.source_client,
-                                target_conn.target_client,
-                                key,
-                                fallback_pttl,
-                                True,
-                                overwrite=True,
-                                expires_at_ms=expires_at_ms,
-                                expected_dump=dump_value,
-                                key_types=self.key_types,
-                                min_ttl=self.filter_min_ttl,
-                                max_key_size=self.filter_max_key_size,
-                            ):
-                                raise RuntimeError(
-                                    f"RESTORE compatibility fallback skipped key {key!r}"
+                                fallback_pttl = (
+                                    -1
+                                    if expires_at_ms is None
+                                    else (
+                                        max(1, int(remaining_ttl_ms))
+                                        if remaining_ttl_ms is not None
+                                        else max(
+                                            1,
+                                            expires_at_ms - int(time.time() * 1000),
+                                        )
+                                    )
                                 )
-                return True
-            except Exception as exc:
-                logger.error("target %s state apply failed: %s", target_name, exc)
-                self._drop_target_stream_connection(target_name, target_conn)
-                return False
+                                if not _sync_key_fallback(
+                                    self.source_client,
+                                    target_conn.target_client,
+                                    key,
+                                    fallback_pttl,
+                                    True,
+                                    overwrite=True,
+                                    expires_at_ms=expires_at_ms,
+                                    expected_dump=dump_value,
+                                    key_types=self.key_types,
+                                    min_ttl=self.filter_min_ttl,
+                                    max_key_size=self.filter_max_key_size,
+                                    expires_at_is_exact=expiry_is_exact,
+                                ):
+                                    raise RuntimeError(
+                                        f"RESTORE compatibility fallback skipped key {key!r}"
+                                    )
+                    return True
+                except Exception as exc:
+                    logger.error("target %s state apply failed: %s", target_name, exc)
+                    self._drop_target_stream_connection(target_name, target_conn)
+                    return False
 
     def _flush_target_scope(self, connection, target_conn) -> None:
         """Apply source FLUSH* without deleting keys outside the sync filters."""
@@ -1048,10 +1316,108 @@ class UnifiedIncrementalService:
             if cursor == 0:
                 break
 
-    def _close_target_stream_connections(self) -> None:
-        for target_name, target_conn in self.target_connections.items():
-            with self._target_locks[target_name]:
-                self._drop_target_stream_connection(target_name, target_conn)
+    @staticmethod
+    def _disconnect_and_release_target_connection(target_conn, connection) -> None:
+        try:
+            connection.disconnect()
+        except Exception:
+            pass
+        try:
+            target_conn.target_client.connection_pool.release(connection)
+        except Exception:
+            pass
+
+    def _finish_target_future(self, target_name: str, future) -> None:
+        with self._target_connections_lock:
+            if self._target_inflight_futures.get(target_name) is future:
+                self._target_inflight_futures.pop(target_name, None)
+
+    def _release_target_connection_after_future(
+        self,
+        target_conn,
+        connection,
+        future,
+    ) -> None:
+        if future is None or future.done():
+            self._disconnect_and_release_target_connection(target_conn, connection)
+            return
+        future.add_done_callback(
+            lambda _completed: self._disconnect_and_release_target_connection(
+                target_conn, connection
+            )
+        )
+
+    def _interrupt_target_stream_connection(
+        self,
+        target_name: str,
+        *,
+        target_conn=None,
+        future=None,
+    ) -> None:
+        """Cancel one target and detach its raw socket without taking its lock."""
+        with self._target_connections_lock:
+            self._cancelled_targets.add(target_name)
+            connection = self._target_stream_connections.pop(target_name, None)
+            self._target_connection_db.pop(target_name, None)
+            self._target_connection_last_used.pop(target_name, None)
+            if target_conn is None:
+                target_conn = self.target_connections.get(target_name)
+            if future is None:
+                future = self._target_inflight_futures.get(target_name)
+        if connection is None or target_conn is None:
+            return
+        try:
+            connection.disconnect()
+        except Exception:
+            pass
+        self._release_target_connection_after_future(
+            target_conn,
+            connection,
+            future,
+        )
+
+    def _start_target_connection_reaper(self) -> None:
+        thread = self._connection_reaper_thread
+        if thread is not None and thread.is_alive():
+            return
+
+        def reap_loop() -> None:
+            interval = max(
+                0.1,
+                min(5.0, self.target_connection_idle_timeout / 2),
+            )
+            while not self.shutdown_event.wait(interval):
+                self._reap_idle_target_connections()
+
+        self._connection_reaper_thread = threading.Thread(
+            target=reap_loop,
+            name="redis-replication-target-reaper",
+            daemon=True,
+        )
+        self._connection_reaper_thread.start()
+
+    def _reap_idle_target_connections(self, now: Optional[float] = None) -> int:
+        """Bound the lifetime of cached raw sockets, including CLOSE-WAIT FDs."""
+        now = time.monotonic() if now is None else float(now)
+        expired = []
+        with self._target_connections_lock:
+            for target_name, connection in list(
+                self._target_stream_connections.items()
+            ):
+                if target_name in self._target_connections_in_use:
+                    continue
+                last_used = self._target_connection_last_used.get(target_name, now)
+                if now - last_used < self.target_connection_idle_timeout:
+                    continue
+                target_conn = self.target_connections.get(target_name)
+                self._target_stream_connections.pop(target_name, None)
+                self._target_connection_db.pop(target_name, None)
+                self._target_connection_last_used.pop(target_name, None)
+                if target_conn is not None:
+                    expired.append((target_conn, connection))
+        for target_conn, connection in expired:
+            self._disconnect_and_release_target_connection(target_conn, connection)
+        return len(expired)
 
     def _interrupt_target_stream_connections(self):
         """Disconnect in-flight target sockets without waiting on target locks."""
@@ -1060,23 +1426,28 @@ class UnifiedIncrementalService:
             for target_name, connection in self._target_stream_connections.items():
                 target_conn = self.target_connections.get(target_name)
                 if target_conn is not None:
-                    active.append((target_conn, connection))
+                    active.append(
+                        (
+                            target_conn,
+                            connection,
+                            self._target_inflight_futures.get(target_name),
+                        )
+                    )
+            self._cancelled_targets.update(self.target_connections)
             self._target_stream_connections.clear()
             self._target_connection_db.clear()
-        for _target_conn, connection in active:
+            self._target_connection_last_used.clear()
+        for target_conn, connection, future in active:
             try:
                 connection.disconnect()
             except Exception:
                 pass
+            self._release_target_connection_after_future(
+                target_conn,
+                connection,
+                future,
+            )
         return active
-
-    @staticmethod
-    def _release_interrupted_target_connections(interrupted) -> None:
-        for target_conn, connection in interrupted:
-            try:
-                target_conn.target_client.connection_pool.release(connection)
-            except Exception:
-                pass
 
     def _print_stats(self):
         snapshot = self.get_stats()
@@ -1089,6 +1460,96 @@ class UnifiedIncrementalService:
                 snapshot["commands_failed"],
                 snapshot["commands_skipped"],
             )
+
+    def get_replication_status(self) -> Dict[str, Any]:
+        """Return liveness, stream offsets and callback-stall diagnostics."""
+        now = time.time()
+        now_monotonic = time.monotonic()
+        with self._replication_state_lock:
+            callback_in_flight = self._callback_count > 0
+            callback_started_at = self._callback_started_at
+            callback_started_monotonic = self._callback_started_monotonic
+            last_progress_time = self._last_progress_time
+            callback_error = self._last_callback_error
+        callback_duration = None
+        if callback_in_flight and callback_started_monotonic is not None:
+            callback_duration = max(
+                0.0, now_monotonic - callback_started_monotonic
+            )
+        stalled = bool(
+            callback_duration is not None
+            and callback_duration >= self.target_command_timeout
+        )
+
+        handler = self.handler
+        handler_running = (
+            bool(getattr(handler, "running"))
+            if handler is not None and hasattr(handler, "running")
+            else None
+        )
+        handler_error_value = getattr(handler, "last_error", None)
+        handler_error = (
+            str(handler_error_value) if handler_error_value is not None else None
+        )
+        committed_offset = getattr(handler, "replication_offset", None)
+        replication_id = getattr(handler, "replication_id", None)
+        baseline_established = bool(
+            self.mode != "psync"
+            or (
+                replication_id
+                and isinstance(committed_offset, int)
+                and committed_offset >= 0
+            )
+        )
+        try:
+            received_offset = getattr(handler, "received_offset", None)
+        except Exception:
+            received_offset = None
+        pending_offset_bytes = None
+        if isinstance(committed_offset, int) and isinstance(received_offset, int):
+            pending_offset_bytes = max(0, received_offset - committed_offset)
+
+        with self._target_connections_lock:
+            open_target_connections = len(self._target_stream_connections)
+        active_target_count = len(self.target_connections)
+        last_error = callback_error or handler_error
+        service_running = bool(
+            self.running
+            and not self.shutdown_event.is_set()
+            and not self._stopped
+        )
+        healthy = bool(
+            service_running
+            and active_target_count > 0
+            and handler_running is not False
+            and baseline_established
+            and not stalled
+            and last_error is None
+        )
+        return {
+            "mode": self.mode,
+            "running": service_running,
+            "healthy": healthy,
+            "handler_running": handler_running,
+            "last_error": last_error,
+            "handler_error": handler_error,
+            "baseline_established": baseline_established,
+            "committed_offset": committed_offset,
+            "received_offset": received_offset,
+            "pending_offset_bytes": pending_offset_bytes,
+            "callback_in_flight": callback_in_flight,
+            "callback_started_at": callback_started_at,
+            "callback_duration": callback_duration,
+            "stalled": stalled,
+            "last_progress_time": last_progress_time,
+            "last_progress_ago": (
+                max(0.0, now - last_progress_time)
+                if last_progress_time is not None
+                else None
+            ),
+            "active_target_count": active_target_count,
+            "open_target_connections": open_target_connections,
+        }
 
     def get_stats(self) -> Dict[str, Any]:
         with self._stats_lock:

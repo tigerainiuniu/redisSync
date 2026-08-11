@@ -11,7 +11,7 @@ import signal
 import sys
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Tuple
 import redis
@@ -23,9 +23,11 @@ from .connection_manager import (
     assert_distinct_redis_databases,
 )
 from .key_sync import (
+    MAX_DUMP_BATCH_BYTES,
     _is_absttl_compatibility_error,
     _is_restore_compatibility_error,
     _sync_key_fallback,
+    capture_dump_with_preflight,
     restore_dump_with_deadline,
 )
 from .migration_orchestrator import MigrationOrchestrator, MigrationConfig, MigrationType
@@ -39,6 +41,8 @@ from .unified_incremental_service import UnifiedIncrementalService
 
 
 SourceFingerprint = Tuple[bytes, Optional[int], bool]
+DEFAULT_SERVICE_STOP_TIMEOUT = 40.0
+COOPERATIVE_STOP_GRACE = 1.0
 
 
 @dataclass
@@ -74,6 +78,7 @@ class CapturedSourceState:
     dump_data: bytes
     expires_at_ms: Optional[int]
     fingerprint: SourceFingerprint
+    expiry_is_exact: bool = False
 
 
 @dataclass
@@ -121,6 +126,8 @@ class RedisSyncService:
         self.executor = ThreadPoolExecutor(
             max_workers=self.config['service']['performance']['max_workers']
         )
+        self._executor_futures = set()
+        self._executor_futures_lock = threading.Lock()
 
         # 同步任务
         self.sync_tasks: List[threading.Thread] = []
@@ -154,6 +161,8 @@ class RedisSyncService:
             Dict[bytes, SourceFingerprint]
         ] = None
         self._realtime_baseline_established = False
+        self._alignment_futures = set()
+        self._alignment_futures_lock = threading.Lock()
 
         self.logger.info("Redis同步服务初始化完成")
     
@@ -228,7 +237,8 @@ class RedisSyncService:
             conn_params = self._redis_connection_kwargs(source_config)
             conn_params.pop('decode_responses', None)
             connection_manager = RedisConnectionManager(
-                retry_config=self.config['service'].get('retry')
+                retry_config=self.config['service'].get('retry'),
+                shutdown_event=self.shutdown_event,
             )
             self.source_conn = connection_manager.connect_source(**conn_params)
             self.logger.info(f"源Redis连接成功: {source_config['host']}:{source_config['port']}")
@@ -241,7 +251,8 @@ class RedisSyncService:
     def _prepare_target_resources(self, target_config: Dict[str, Any]):
         """Connect and initialize a target without exposing it to live fan-out."""
         conn_manager = RedisConnectionManager(
-            retry_config=self.config['service'].get('retry')
+            retry_config=self.config['service'].get('retry'),
+            shutdown_event=self.shutdown_event,
         )
         try:
             conn_manager.set_source_client(
@@ -255,7 +266,10 @@ class RedisSyncService:
                 conn_manager.target_client, target_config
             )
 
-            orchestrator = MigrationOrchestrator(conn_manager)
+            orchestrator = MigrationOrchestrator(
+                conn_manager,
+                shutdown_event=self.shutdown_event,
+            )
             scan_count = self.config['service']['performance'].get(
                 'scan_count', 10000
             )
@@ -358,6 +372,8 @@ class RedisSyncService:
     def _connect_targets(self) -> bool:
         """Connect every enabled target while keeping healthy ones available."""
         for target_config in self.config['targets']:
+            if self._service_is_stopping():
+                break
             if target_config.get('enabled', True):
                 self._connect_target(target_config)
         return bool(self.target_connections)
@@ -427,7 +443,7 @@ class RedisSyncService:
                 full_sync_config.get('verify_migration', True)
                 and sync_config['mode'] == 'full'
             ),
-            verify_mode=full_sync_config.get('verify_mode', 'fast'),
+            verify_mode=full_sync_config.get('verify_mode', 'full'),
             verify_sample_size=full_sync_config.get('verify_sample_size', 100),
             full_strategy=full_sync_config.get('strategy', 'scan'),
             clear_target=full_sync_config.get('clear_target', False),
@@ -624,6 +640,71 @@ class RedisSyncService:
         )
         return max(1, min(int(configured), 200))
 
+    def _payload_bounded_source_groups(self, source, keys):
+        """Plan source DUMP groups without materializing their payloads."""
+        candidates = list(keys)
+        if len(candidates) <= 1:
+            return [candidates] if candidates else []
+
+        sizes = []
+        batch_size = self._pipeline_batch_size()
+        try:
+            for offset in range(0, len(candidates), batch_size):
+                chunk = candidates[offset:offset + batch_size]
+                pipe = source.pipeline(transaction=False)
+                for key in chunk:
+                    pipe.execute_command('MEMORY', 'USAGE', key)
+                raw_sizes = pipe.execute(raise_on_error=False)
+                if len(raw_sizes) != len(chunk):
+                    raise RuntimeError(
+                        "MEMORY USAGE response count mismatch: "
+                        f"{len(raw_sizes)} != {len(chunk)}"
+                    )
+                sizes.extend(raw_sizes)
+        except Exception as error:
+            self.logger.warning(
+                "MEMORY USAGE batch planning failed; capturing keys singly: %s",
+                error,
+            )
+            return [[key] for key in candidates]
+
+        groups = []
+        current_group = []
+        current_bytes = 0
+
+        def flush_group():
+            nonlocal current_group
+            nonlocal current_bytes
+            if current_group:
+                groups.append(current_group)
+                current_group = []
+                current_bytes = 0
+
+        for key, raw_size in zip(candidates, sizes):
+            if (
+                isinstance(raw_size, BaseException)
+                or isinstance(raw_size, bool)
+                or not isinstance(raw_size, int)
+                or raw_size <= 0
+            ):
+                flush_group()
+                groups.append([key])
+                continue
+            if current_group and (
+                len(current_group) >= batch_size
+                or current_bytes + raw_size > MAX_DUMP_BATCH_BYTES
+            ):
+                flush_group()
+            current_group.append(key)
+            current_bytes += raw_size
+            if (
+                len(current_group) >= batch_size
+                or current_bytes >= MAX_DUMP_BATCH_BYTES
+            ):
+                flush_group()
+        flush_group()
+        return groups
+
     @staticmethod
     def _snapshot_entry_size(key: bytes, fingerprint) -> int:
         size = sys.getsizeof(key) + sys.getsizeof(fingerprint)
@@ -674,6 +755,8 @@ class RedisSyncService:
 
     def _build_source_snapshot(self) -> Dict[bytes, SourceFingerprint]:
         """Scan the managed keyspace and fingerprint values plus absolute expiry."""
+        if self._service_is_stopping():
+            raise RuntimeError("service is stopping")
         inc_config = self.config['sync']['incremental_sync']
         key_pattern = inc_config.get('key_pattern', '*')
         key_types = inc_config.get('key_types')
@@ -704,6 +787,8 @@ class RedisSyncService:
         cursor = 0
 
         while True:
+            if self._service_is_stopping():
+                raise RuntimeError("service is stopping")
             cursor, raw_keys = source.scan(
                 cursor=cursor,
                 match=key_pattern,
@@ -714,6 +799,8 @@ class RedisSyncService:
             if key_types and keys:
                 typed_keys = []
                 for offset in range(0, len(keys), pipeline_batch_size):
+                    if self._service_is_stopping():
+                        raise RuntimeError("service is stopping")
                     chunk = keys[offset:offset + pipeline_batch_size]
                     pipe = source.pipeline(transaction=False)
                     for key in chunk:
@@ -739,8 +826,9 @@ class RedisSyncService:
                     for key in self._sync_key_filter.filter_batch(source, keys)
                 ]
 
-            for offset in range(0, len(keys), pipeline_batch_size):
-                chunk = keys[offset:offset + pipeline_batch_size]
+            for chunk in self._payload_bounded_source_groups(source, keys):
+                if self._service_is_stopping():
+                    raise RuntimeError("service is stopping")
                 has_pexpiretime = self._source_has_pexpiretime(source, chunk[0])
                 pipe = source.pipeline(transaction=True)
                 for key in chunk:
@@ -774,6 +862,9 @@ class RedisSyncService:
                     expires_at = None
                     expiry_is_exact = False
                     if ttl_ms > 0:
+                        remaining_ttl_ms = ttl_ms - elapsed_ms
+                        if remaining_ttl_ms <= 0:
+                            continue
                         if not isinstance(pexpiretime, Exception):
                             try:
                                 absolute_ms = int(pexpiretime)
@@ -783,9 +874,6 @@ class RedisSyncService:
                                 expires_at = absolute_ms
                                 expiry_is_exact = True
                         if expires_at is None:
-                            remaining_ttl_ms = ttl_ms - elapsed_ms
-                            if remaining_ttl_ms <= 0:
-                                continue
                             expires_at = observed_at_ms + remaining_ttl_ms
                     fingerprint = (
                         hashlib.sha256(dump_data).digest(),
@@ -980,15 +1068,6 @@ class RedisSyncService:
         needs_type = bool(key_types)
         needs_memory = max_key_size > 0
         pipeline_batch_size = self._pipeline_batch_size()
-        has_pexpiretime = self._source_has_pexpiretime(
-            source_client, keys[0]
-        )
-        stride = (
-            2
-            + int(has_pexpiretime)
-            + int(needs_type)
-            + int(needs_memory)
-        )
         captured_payload_size = 0
 
         if (
@@ -998,6 +1077,66 @@ class RedisSyncService:
             raise MemoryError(
                 "source snapshot memory_limit exceeded before capturing upserts"
             )
+
+        def record_state(
+            key,
+            dump_data,
+            expires_at_ms,
+            expiry_is_exact,
+        ):
+            nonlocal captured_payload_size
+            fingerprint = (
+                hashlib.sha256(dump_data).digest(),
+                expires_at_ms,
+                expiry_is_exact,
+            )
+            state = CapturedSourceState(
+                key=key,
+                dump_data=dump_data,
+                expires_at_ms=expires_at_ms,
+                fingerprint=fingerprint,
+                expiry_is_exact=expiry_is_exact,
+            )
+            captured[key] = state
+            captured_payload_size += (
+                sys.getsizeof(state) + sys.getsizeof(dump_data)
+            )
+            if (
+                capture_memory_limit
+                and sys.getsizeof(captured) + captured_payload_size
+                > capture_memory_limit
+            ):
+                captured.pop(key, None)
+                raise MemoryError(
+                    "source snapshot memory_limit exceeded while capturing "
+                    "upsert payloads"
+                )
+
+        if needs_memory:
+            for key in keys:
+                state = capture_dump_with_preflight(
+                    source_client,
+                    key,
+                    preserve_ttl=True,
+                    key_types=key_types,
+                    min_ttl=min_ttl,
+                    max_key_size=max_key_size,
+                )
+                if state is None:
+                    invalid.append(key)
+                    continue
+                record_state(
+                    key,
+                    state.dump_data,
+                    state.expires_at_ms,
+                    getattr(state, 'expiry_is_exact', False),
+                )
+            return captured, invalid
+
+        has_pexpiretime = self._source_has_pexpiretime(
+            source_client, keys[0]
+        )
+        stride = 2 + int(has_pexpiretime) + int(needs_type)
 
         for offset in range(0, len(keys), pipeline_batch_size):
             chunk = keys[offset:offset + pipeline_batch_size]
@@ -1058,16 +1197,15 @@ class RedisSyncService:
                         absolute_ms = int(pexpiretime)
                     except (TypeError, ValueError):
                         absolute_ms = -1
-                    if absolute_ms > 0:
-                        expires_at_ms = absolute_ms
-                        expiry_is_exact = True
-                        remaining_ttl_ms = absolute_ms - observed_at_ms
-                    else:
-                        remaining_ttl_ms = ttl_ms - elapsed_ms
-                        expires_at_ms = observed_at_ms + remaining_ttl_ms
+                    remaining_ttl_ms = ttl_ms - elapsed_ms
                     if remaining_ttl_ms <= 0:
                         invalid.append(key)
                         continue
+                    if absolute_ms > 0:
+                        expires_at_ms = absolute_ms
+                        expiry_is_exact = True
+                    else:
+                        expires_at_ms = observed_at_ms + remaining_ttl_ms
 
                 if not source_state_in_dynamic_scope(
                     remaining_ttl_ms,
@@ -1080,31 +1218,12 @@ class RedisSyncService:
                     invalid.append(key)
                     continue
 
-                fingerprint = (
-                    hashlib.sha256(dump_data).digest(),
+                record_state(
+                    key,
+                    dump_data,
                     expires_at_ms,
                     expiry_is_exact,
                 )
-                state = CapturedSourceState(
-                    key=key,
-                    dump_data=dump_data,
-                    expires_at_ms=expires_at_ms,
-                    fingerprint=fingerprint,
-                )
-                captured[key] = state
-                captured_payload_size += (
-                    sys.getsizeof(state) + sys.getsizeof(dump_data)
-                )
-                if (
-                    capture_memory_limit
-                    and sys.getsizeof(captured) + captured_payload_size
-                    > capture_memory_limit
-                ):
-                    captured.pop(key, None)
-                    raise MemoryError(
-                        "source snapshot memory_limit exceeded while capturing "
-                        "upsert payloads"
-                    )
 
         return captured, invalid
 
@@ -1211,21 +1330,17 @@ class RedisSyncService:
                     state = source_states.get(key)
                     if state is not None:
                         entries.append(
-                            (key, state.expires_at_ms, state.dump_data)
+                            (
+                                key,
+                                state.expires_at_ms,
+                                state.dump_data,
+                                state.expiry_is_exact,
+                            )
                         )
-
-                target_now_ms = int(time.time() * 1000)
-                live_entries = []
-                for key, expires_at, dump_data in entries:
-                    if expires_at is not None:
-                        if expires_at <= target_now_ms:
-                            vanished.append(key)
-                            continue
-                    live_entries.append((key, expires_at, dump_data))
 
                 target_pipe = target_client.pipeline(transaction=False)
                 target_operations = []
-                for key, expires_at, dump_data in live_entries:
+                for key, expires_at, dump_data, expiry_is_exact in entries:
                     if expires_at is None:
                         target_pipe.restore(key, 0, dump_data, replace=True)
                     else:
@@ -1237,7 +1352,13 @@ class RedisSyncService:
                             absttl=True,
                         )
                     target_operations.append(
-                        ('restore', key, expires_at, dump_data)
+                        (
+                            'restore',
+                            key,
+                            expires_at,
+                            dump_data,
+                            expiry_is_exact,
+                        )
                     )
                 results = (
                     target_pipe.execute(raise_on_error=False)
@@ -1250,7 +1371,13 @@ class RedisSyncService:
                         f"{len(results)} != {len(target_operations)}"
                     )
                 for target_operation, result in zip(target_operations, results):
-                    operation, key, expires_at, dump_data = target_operation
+                    (
+                        operation,
+                        key,
+                        expires_at,
+                        dump_data,
+                        expiry_is_exact,
+                    ) = target_operation
                     if not isinstance(result, Exception):
                         continue
                     if (
@@ -1270,6 +1397,7 @@ class RedisSyncService:
                                     expires_at,
                                     overwrite=True,
                                     prefer_absttl=False,
+                                    expires_at_is_exact=expiry_is_exact,
                                 )
                             except redis.ResponseError as legacy_error:
                                 if not _is_restore_compatibility_error(legacy_error):
@@ -1300,6 +1428,7 @@ class RedisSyncService:
                             key_types=key_types,
                             min_ttl=min_ttl,
                             max_key_size=max_key_size,
+                            expires_at_is_exact=expiry_is_exact,
                         ):
                             continue
                         raise RuntimeError(
@@ -1459,6 +1588,7 @@ class RedisSyncService:
                     pending_deletions,
                     changes.captured_upserts,
                 )
+                self._track_executor_future(future)
                 futures.append((target_name, pending_deletions, future))
 
             # 等待所有同步完成
@@ -1950,6 +2080,8 @@ class RedisSyncService:
         bootstrap_current=None,
         bootstrap_clear_target: bool = False,
     ) -> bool:
+        if self._service_is_stopping():
+            return False
         config = self._recovery_sync_config(
             clear_target=bootstrap_clear_target
         )
@@ -1982,6 +2114,8 @@ class RedisSyncService:
         self, _rdb_data: bytes, *, force_recovery: bool = False
     ) -> bool:
         """Align active targets at FULLRESYNC before applying buffered commands."""
+        if self._service_is_stopping():
+            return False
         target_names = list(self.target_connections)
         is_bootstrap = (
             not force_recovery
@@ -2004,42 +2138,131 @@ class RedisSyncService:
             self._realtime_baseline_established = True
             self._realtime_bootstrap_snapshot = None
             return True
-        with ThreadPoolExecutor(max_workers=min(len(target_names), 8)) as executor:
-            futures = {
-                name: executor.submit(
+
+        executor = ThreadPoolExecutor(
+            max_workers=min(len(target_names), 8),
+            thread_name_prefix="redis-fullresync-alignment",
+        )
+        future_targets = {
+            executor.submit(
                     self._align_realtime_target,
                     name,
                     prune_managed_scope=not is_bootstrap,
                     bootstrap_previous=bootstrap_previous,
                     bootstrap_current=bootstrap_current,
                     bootstrap_clear_target=bootstrap_clear_target,
+                ): name
+            for name in target_names
+        }
+        self._track_alignment_futures(future_targets)
+        pending = set(future_targets)
+        try:
+            while pending:
+                if self._service_is_stopping():
+                    for future in pending:
+                        future.cancel()
+                    return False
+                done, pending = wait(
+                    pending,
+                    timeout=0.05,
+                    return_when=FIRST_COMPLETED,
                 )
-                for name in target_names
-            }
-            for target_name, future in futures.items():
-                try:
-                    if not future.result():
+                for future in done:
+                    target_name = future_targets[future]
+                    if self._service_is_stopping():
+                        for remaining in pending:
+                            remaining.cancel()
+                        return False
+                    try:
+                        aligned = future.result()
+                    except Exception as exc:
+                        self.logger.error(
+                            "FULLRESYNC 目标对齐失败 %s: %s", target_name, exc
+                        )
+                        self._record_target_failure(
+                            self.stats.setdefault(target_name, SyncStats()),
+                            exc,
+                            failed_operations=1,
+                            force_unhealthy=True,
+                        )
                         self._deactivate_realtime_target(
                             target_name, force=True, record_failure=False
                         )
-                except Exception as exc:
-                    self.logger.error(
-                        "FULLRESYNC 目标对齐失败 %s: %s", target_name, exc
-                    )
-                    self._record_target_failure(
-                        self.stats.setdefault(target_name, SyncStats()),
-                        exc,
-                        failed_operations=1,
-                        force_unhealthy=True,
-                    )
-                    self._deactivate_realtime_target(
-                        target_name, force=True, record_failure=False
-                    )
+                    else:
+                        if not aligned:
+                            self._deactivate_realtime_target(
+                                target_name, force=True, record_failure=False
+                            )
+        finally:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:  # Python 3.7/3.8 compatibility
+                executor.shutdown(wait=False)
         self._realtime_baseline_established = True
         self._realtime_bootstrap_snapshot = None
         # Failed targets are recovered from a fresh full copy later. Keeping the
         # source stream moving prevents one outage from stalling healthy targets.
         return True
+
+    def _track_alignment_futures(self, future_targets) -> None:
+        lock = getattr(self, '_alignment_futures_lock', None)
+        if lock is None:
+            lock = self._alignment_futures_lock = threading.Lock()
+        active = getattr(self, '_alignment_futures', None)
+        if active is None:
+            active = self._alignment_futures = set()
+        with lock:
+            active.update(future_targets)
+
+        def discard(completed) -> None:
+            with lock:
+                active.discard(completed)
+
+        for future in future_targets:
+            future.add_done_callback(discard)
+
+    def _wait_for_alignment_futures(self, timeout: float) -> bool:
+        lock = getattr(self, '_alignment_futures_lock', None)
+        active = getattr(self, '_alignment_futures', None)
+        if lock is None or active is None:
+            return True
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            with lock:
+                pending = {future for future in active if not future.done()}
+            if not pending:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            wait(pending, timeout=min(0.05, remaining))
+
+    def _track_executor_future(self, future) -> None:
+        add_done_callback = getattr(future, 'add_done_callback', None)
+        if not callable(add_done_callback):
+            return
+        lock = getattr(self, '_executor_futures_lock', None)
+        if lock is None:
+            lock = self._executor_futures_lock = threading.Lock()
+        active = getattr(self, '_executor_futures', None)
+        if active is None:
+            active = self._executor_futures = set()
+        with lock:
+            active.add(future)
+
+        def discard(completed) -> None:
+            with lock:
+                active.discard(completed)
+
+        add_done_callback(discard)
+
+    def _pending_executor_futures(self):
+        lock = getattr(self, '_executor_futures_lock', None)
+        active = getattr(self, '_executor_futures', None)
+        if lock is None or active is None:
+            return set()
+        with lock:
+            return {future for future in active if not future.done()}
 
     def _apply_database_resync(self) -> bool:
         return self._apply_replication_snapshot(b'', force_recovery=True)
@@ -2227,12 +2450,22 @@ class RedisSyncService:
             if not started and not stopped_elsewhere:
                 self.stop()
     
-    def stop(self):
-        """停止同步服务"""
+    def stop(self, timeout: float = DEFAULT_SERVICE_STOP_TIMEOUT):
+        """Stop every service component within one shared deadline."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+
+        def remaining() -> float:
+            return max(0.0, deadline - time.monotonic())
+
+        shutdown_errors = []
         lifecycle_lock = getattr(self, '_lifecycle_lock', None)
         if lifecycle_lock is None:
             lifecycle_lock = self._lifecycle_lock = threading.RLock()
-        with lifecycle_lock:
+        if not lifecycle_lock.acquire(timeout=remaining()):
+            message = "获取停止生命周期锁超时"
+            self.logger.error("Redis同步服务停止不完整: %s", message)
+            raise RuntimeError(message)
+        try:
             stop_complete = getattr(self, '_stop_complete', None)
             if stop_complete is None:
                 stop_complete = self._stop_complete = threading.Event()
@@ -2253,26 +2486,45 @@ class RedisSyncService:
                 != threading.get_ident()
             )
             start_complete = getattr(self, '_start_complete', None)
+        finally:
+            lifecycle_lock.release()
         if not owns_stop:
             if wait_for_stop:
-                stop_complete.wait()
+                if not stop_complete.wait(remaining()):
+                    message = "等待现有停止流程超时"
+                    self.logger.error("Redis同步服务停止不完整: %s", message)
+                    raise RuntimeError(message)
             return
         if starting_elsewhere and start_complete is not None:
-            start_complete.wait()
+            if not start_complete.wait(remaining()):
+                shutdown_errors.append("启动流程未退出")
 
         self.logger.info("停止Redis同步服务...")
         try:
-            if self.incremental_service:
+            incremental_service = self.incremental_service
+            if incremental_service:
                 try:
-                    self.incremental_service.stop()
+                    try:
+                        incremental_service.stop(timeout=0)
+                    except TypeError:
+                        incremental_service.stop()
                 except Exception as e:
-                    self.logger.warning("实时复制服务停止失败: %s", e)
+                    shutdown_errors.append(f"实时复制服务停止失败: {e}")
 
             current = threading.current_thread()
-            for thread in list(self.sync_tasks):
-                if thread is not current:
-                    thread.join(timeout=30)
+            sync_tasks = [
+                thread for thread in list(self.sync_tasks) if thread is not current
+            ]
+            grace_deadline = min(
+                deadline, time.monotonic() + COOPERATIVE_STOP_GRACE
+            )
+            for thread in sync_tasks:
+                thread.join(
+                    timeout=max(0.0, grace_deadline - time.monotonic())
+                )
 
+            # Closing Redis pools after the cooperative grace interrupts SCAN,
+            # target writes, and replication reads that are still blocked in I/O.
             managers = list(self.target_connections.values())
             self.target_connections.clear()
             orchestrators = getattr(self, 'orchestrators', None)
@@ -2296,33 +2548,111 @@ class RedisSyncService:
                 except Exception:
                     pass
 
-            self.executor.shutdown(wait=True)
+            alive_sync_tasks = []
+            for thread in sync_tasks:
+                thread.join(timeout=remaining())
+                is_alive = getattr(thread, 'is_alive', None)
+                if callable(is_alive) and is_alive():
+                    alive_sync_tasks.append(
+                        getattr(thread, 'name', repr(thread))
+                    )
+            if alive_sync_tasks:
+                shutdown_errors.append(
+                    "同步协调线程未退出: " + ", ".join(alive_sync_tasks)
+                )
+
+            if not self._wait_for_alignment_futures(remaining()):
+                shutdown_errors.append("FULLRESYNC 目标对齐线程未退出")
+
+            if incremental_service is not None:
+                wait_stopped = getattr(incremental_service, 'wait_stopped', None)
+                if callable(wait_stopped):
+                    try:
+                        replication_stopped = bool(wait_stopped(remaining()))
+                    except Exception as exc:
+                        shutdown_errors.append(f"确认实时复制线程失败: {exc}")
+                    else:
+                        if not replication_stopped:
+                            shutdown_errors.append("实时复制线程未退出")
+
+            pending_executor_futures = self._pending_executor_futures()
+            for future in pending_executor_futures:
+                future.cancel()
+            try:
+                self.executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:  # Python 3.7/3.8 compatibility
+                self.executor.shutdown(wait=False)
+            still_running_futures = {
+                future
+                for future in pending_executor_futures
+                if not future.done()
+            }
+            if still_running_futures:
+                shutdown_errors.append(
+                    "服务线程池仍有 %s 个任务未退出"
+                    % len(still_running_futures)
+                )
 
             if self.web_ui:
                 try:
-                    self.web_ui.stop()
+                    try:
+                        web_stopped = self.web_ui.stop(timeout=remaining())
+                    except TypeError:
+                        web_stopped = self.web_ui.stop()
+                    if web_stopped is False:
+                        shutdown_errors.append("Web UI 线程未退出")
                 except Exception as e:
-                    self.logger.warning(f"Web UI停止失败: {e}")
+                    shutdown_errors.append(f"Web UI停止失败: {e}")
 
+            if shutdown_errors:
+                message = "; ".join(shutdown_errors)
+                self.logger.error("Redis同步服务停止不完整: %s", message)
+                raise RuntimeError(message)
             self.logger.info("Redis同步服务已停止")
         finally:
             stop_complete.set()
     
     def get_status(self) -> Dict[str, Any]:
         """获取服务状态"""
+        targets = {
+            name: {
+                'healthy': stats.is_healthy,
+                'total_synced': stats.total_synced,
+                'total_failed': stats.total_failed,
+                'last_sync_time': stats.last_sync_time,
+                'last_error': stats.last_error,
+                'consecutive_failures': stats.consecutive_failures
+            }
+            for name, stats in self.stats.items()
+        }
+        replication = None
+        incremental_service = getattr(self, 'incremental_service', None)
+        if incremental_service is not None:
+            status_callback = getattr(
+                incremental_service, 'get_replication_status', None
+            )
+            if callable(status_callback):
+                try:
+                    replication = status_callback()
+                except Exception as exc:
+                    replication = {
+                        'running': False,
+                        'healthy': False,
+                        'last_error': f'failed to read replication status: {exc}',
+                    }
+        targets_healthy = bool(targets) and all(
+            target['healthy'] for target in targets.values()
+        )
+        replication_healthy = (
+            replication is None or replication.get('healthy') is True
+        )
         return {
             'running': self.running,
-            'targets': {
-                name: {
-                    'healthy': stats.is_healthy,
-                    'total_synced': stats.total_synced,
-                    'total_failed': stats.total_failed,
-                    'last_sync_time': stats.last_sync_time,
-                    'last_error': stats.last_error,
-                    'consecutive_failures': stats.consecutive_failures
-                }
-                for name, stats in self.stats.items()
-            }
+            'healthy': bool(
+                self.running and targets_healthy and replication_healthy
+            ),
+            'replication': replication,
+            'targets': targets,
         }
     
     def run(self):

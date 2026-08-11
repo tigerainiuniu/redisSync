@@ -2,6 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.7+](https://img.shields.io/badge/python-3.7+-blue.svg)](https://www.python.org/downloads/)
+[![Tests](https://github.com/tigerainiuniu/redisSync/actions/workflows/tests.yml/badge.svg)](https://github.com/tigerainiuniu/redisSync/actions/workflows/tests.yml)
 
 一个高性能、支持一对多Redis实例持续同步的服务，专为跨境远距离传输优化。
 
@@ -22,6 +23,7 @@
 
 - [快速开始](#-快速开始)
 - [安装](#-安装)
+- [生产部署](#-生产部署systemd)
 - [配置说明](#-配置说明)
 - [性能优化](#-多目标同步优化)
 - [跨境传输](#-跨境远距离传输支持)
@@ -66,6 +68,8 @@ docker compose -f docker/redis-five/docker-compose.yml down
 - PyYAML >= 6.0
 - colorlog >= 6.0.0
 - tqdm >= 4.64.0
+
+GitHub Actions 会在 Python 3.7、3.8、3.9 和 3.12 上执行完整测试，并将运行时警告视为失败。
 
 ## 🚀 快速开始
 
@@ -112,6 +116,50 @@ python run_sync_service.py --check-config
 
 查看实时同步状态、统计信息和目标健康状况。
 
+## 🏭 生产部署（systemd）
+
+仓库内的 `redis-sync.service` 使用专用账号、固定目录和虚拟环境：
+
+- 程序目录：`/opt/redis-sync`
+- 配置文件：`/etc/redis-sync/config.yaml`
+- 应用日志：`/var/log/redis-sync/redis-sync.log`
+- systemd 日志：`journalctl -u redis-sync`
+
+```bash
+# 创建专用账号并安装程序
+sudo useradd --system --home-dir /opt/redis-sync --shell /usr/sbin/nologin redis-sync
+sudo install -d -m 0755 -o root -g root /opt/redis-sync
+sudo git clone https://github.com/tigerainiuniu/redisSync.git /opt/redis-sync
+sudo python3 -m venv /opt/redis-sync/.venv
+sudo /opt/redis-sync/.venv/bin/pip install -r /opt/redis-sync/requirements.txt
+
+# 安装配置；编辑后将 service.logging.file 设为
+# /var/log/redis-sync/redis-sync.log
+sudo install -d -m 0750 -o root -g redis-sync /etc/redis-sync
+sudo install -d -m 0750 -o redis-sync -g redis-sync /var/log/redis-sync
+sudo install -m 0640 -o root -g redis-sync \
+  /opt/redis-sync/config.yaml.example /etc/redis-sync/config.yaml
+sudo editor /etc/redis-sync/config.yaml
+
+# 校验配置并启动
+sudo -u redis-sync /opt/redis-sync/.venv/bin/python \
+  /opt/redis-sync/run_sync_service.py \
+  --config /etc/redis-sync/config.yaml --check-config
+sudo install -m 0644 /opt/redis-sync/redis-sync.service /etc/systemd/system/redis-sync.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now redis-sync
+```
+
+```bash
+systemctl status redis-sync
+journalctl -u redis-sync -f
+sudo systemctl restart redis-sync
+sudo systemctl stop redis-sync
+```
+
+修改 `redis-sync.service` 后执行 `sudo systemctl daemon-reload`。更新代码或依赖后先运行配置检查，再重启服务。
+示例 unit 使用 `Restart=always`，因此复制线程异常退出后即使进程返回成功状态也会自动拉起；执行 `systemctl stop redis-sync` 属于 systemd 主动停止，不会触发自动重启。
+
 ## 📋 配置说明
 
 ### 基本配置结构
@@ -145,14 +193,19 @@ sync:
   full_sync:
     strategy: "scan"
     batch_size: 1000
+    scan_count: 10000
     preserve_ttl: true
     clear_target: false
     overwrite_existing: true
+    verify_migration: true
+    verify_mode: "full"
     
   incremental_sync:
     enabled: true
     method: "psync"
     apply_mode: "key_state"
+    target_command_timeout: 5  # 单个目标写入的硬截止时间（秒）
+    target_connection_idle_timeout: 60  # 空闲实时写连接回收时间（秒）
     capture_max_size: 1073741824  # FULLRESYNC 对齐期间复制流缓存总上限，默认 1 GiB
 
 # Web API 访问控制
@@ -177,6 +230,9 @@ web_ui:
 - **sync**: 兼容别名；因客户端不直接装载 RDB，实际执行 SCAN+DUMP/RESTORE
 - **dump_restore**: 使用DUMP/RESTORE命令序列化迁移
 - `clear_target: false` 保留目标端仅有的键；`clear_target: true` 在复制前对目标数据库执行 `FLUSHDB`，包括过滤范围外的键
+- 验证默认使用 `verify_mode: full`，对验证样本比较键的存在性、类型、值和 TTL。显式设置 `fast` 时仅检查存在性和类型结构，同类型但值不同的键会被视为匹配
+- `migration.scan_count`、`sync.full_sync.scan_count` 与 `service.performance.scan_count` 建议设置为 5000-20000，硬上限为 100000；更大的 SCAN 页会被配置校验拒绝
+- 源端 DUMP 捕获和目标端 RESTORE 管道均按最多 200 键、累计约 16 MiB 进行分组；配置 `max_key_size` 时会先通过 `MEMORY USAGE` 预检，超限键不会被 DUMP 物化
 
 ### 增量同步 (Incremental Sync)
 - **psync（推荐）**：使用 Redis PSYNC 复制流；无法续传时接收 RDB 快照并重新对齐目标
@@ -184,12 +240,14 @@ web_ui:
 - **scan**：定时扫描，以键的序列化内容和绝对过期时间指纹检测更新、删除和 TTL 变化
 - 常驻服务默认且必须使用 `apply_mode: key_state`，按源端当前键状态执行 `RESTORE`/`DEL`，使重试保持幂等并支持键过滤；配置 `direct` 会在启动校验时被拒绝
 - `command_dedup_window` 必须为 `0`；复制流允许连续出现相同的合法写命令，按内容去重会造成数据丢失
+- `target_command_timeout` 默认为 `5` 秒，是单个目标写入的硬截止时间。超时时服务会断开该目标的底层连接并继续向其他健康目标分发
 - TTL 以绝对毫秒时间写入目标；源 Redis、同步主机和目标 Redis 的系统时钟需保持同步，时钟偏差会等量影响过期时间
 - 目标不支持 `RESTORE ABSTTL` 时使用临时键、`PEXPIREAT` 和原子重命名保持截止时间；DUMP 格式不兼容时，字符串及常见容器类型会在 `WATCH` 保护下按类型复制，源状态变化会触发重试。stream 不走类型级降级，以保留 consumer group/PEL 语义
 
 ### 混合模式 (Hybrid)
 - 使用 `psync`/`sync` 时先建立 PSYNC 流和首次 `FULLRESYNC` 边界，再执行全量 DUMP/RESTORE 对齐，最后回放对齐期间捕获的复制命令，避免“先全量、后建流”遗漏并发写入
 - 捕获数据会从内存转存磁盘，内存与磁盘中的未消费复制流合计受 `capture_max_size` 限制；默认值为 `1073741824`（1 GiB），超限会中止本次复制而不静默丢弃命令
+- 磁盘缓存使用系统临时目录下的 `redis-sync-repl-*.spool` 文件；启动复制时会根据进程锁清理崩溃遗留文件，并保留正在被其他实例使用的文件
 - 首次对齐时，`clear_target: false` 保留目标端仅有的键；`clear_target: true` 会在复制流开始捕获后对每个目标数据库执行 `FLUSHDB`
 - 使用 `scan` 时先记录源快照，再执行全量迁移和对账，然后进入轮询。故障目标恢复时只重建受管范围，过滤范围外的目标键会保留
 
@@ -291,6 +349,17 @@ curl -u 'redis-sync:replace-with-a-secret' http://localhost:8080/api/status
 ```
 
 Basic Auth 的用户名可自行设置，密码位必须是 `security.api_key`。`/api/config` 会递归隐藏密码、token、API key、URL/DSN 等敏感字段。
+
+`/api/status` 的顶层 `running` 表示服务进程正在工作，`healthy` 还会综合目标可用性和复制流状态。`replication` 字段包含 `baseline_established`、`committed_offset`、`received_offset`、`pending_offset_bytes`、`callback_duration`、`stalled` 和 `last_error`，可用于区分进程存活、FULLRESYNC 基线尚未建立、复制积压和目标写入阻塞。Web 页面会将 `running: true`、`healthy: false` 显示为“运行异常”。
+
+默认的 `web_ui.host: 127.0.0.1` 仅监听本机。监听 `0.0.0.0`、`::` 或其他非 loopback 地址时，配置校验要求满足以下任一条件：
+
+- 启用 `security.auth_enabled` 并设置非空 `security.api_key`。
+- 保持认证关闭，但 `security.allowed_ips` 必须是非空列表，且全部为 loopback IP/CIDR（例如 `127.0.0.0/8`、`::1/128`）。此模式用于兼容仅由本机反向代理访问的部署。
+
+远程访问建议由 TLS 反向代理转发到 `127.0.0.1:8080`，同时启用 API key 认证。Web 服务直接对外监听时不要配置空白名单、`*`、非 loopback 或无效 CIDR 作为匿名访问范围。
+
+内置 Web 服务最多同时处理 32 个请求，超过上限时立即返回 `503 Service Unavailable`。它适合状态查看和管理接口，不承担公网入口的连接治理；远程入口应由反向代理配置连接数、请求速率和总请求时限。
 
 ### 连接池容量
 

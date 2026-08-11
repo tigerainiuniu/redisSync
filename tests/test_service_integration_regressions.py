@@ -1,5 +1,6 @@
 import logging
 import threading
+import time
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -107,16 +108,19 @@ def test_stop_stops_incremental_service_before_joining_workers():
     events = []
 
     class FakeIncrementalService:
-        def stop(self):
-            events.append("incremental-stop")
+        def stop(self, timeout):
+            events.append(("incremental-stop", timeout))
 
     class FakeWorker:
         def join(self, timeout):
             events.append(("worker-join", timeout))
 
+        def is_alive(self):
+            return False
+
     class FakeExecutor:
-        def shutdown(self, wait):
-            events.append(("executor-shutdown", wait))
+        def shutdown(self, wait, cancel_futures=False):
+            events.append(("executor-shutdown", wait, cancel_futures))
 
     service = RedisSyncService.__new__(RedisSyncService)
     service.logger = logging.getLogger("test-service-stop-order")
@@ -131,9 +135,71 @@ def test_stop_stops_incremental_service_before_joining_workers():
 
     service.stop()
 
-    assert events[:2] == ["incremental-stop", ("worker-join", 30)]
+    assert events[0] == ("incremental-stop", 0)
+    assert events[1][0] == "worker-join"
+    assert 0 < events[1][1] <= 1
+    assert ("executor-shutdown", False, True) in events
     assert service.running is False
     assert service.shutdown_event.is_set()
+
+
+def test_stop_closes_connections_before_final_replication_exit_check():
+    events = []
+
+    class FakeManager:
+        def close(self):
+            events.append("connection-close")
+
+    class FakeIncrementalService:
+        def stop(self, timeout):
+            events.append(("incremental-stop", timeout))
+            return False
+
+        def wait_stopped(self, timeout):
+            events.append(("replication-wait", timeout))
+            return "connection-close" in events
+
+    service = RedisSyncService.__new__(RedisSyncService)
+    service.logger = logging.getLogger("test-service-final-stop-check")
+    service.running = True
+    service.shutdown_event = threading.Event()
+    service.incremental_service = FakeIncrementalService()
+    service.sync_tasks = []
+    service.target_connections = {"target": FakeManager()}
+    service.orchestrators = {}
+    service.source_conn = None
+    service.executor = MagicMock()
+    service.web_ui = None
+
+    service.stop()
+
+    assert events[:2] == [("incremental-stop", 0), "connection-close"]
+    assert events[2][0] == "replication-wait"
+    assert 0 < events[2][1] <= 40
+
+
+def test_stop_reports_replication_thread_that_remains_alive():
+    class StuckIncrementalService:
+        def stop(self):
+            return False
+
+        def wait_stopped(self, _timeout):
+            return False
+
+    service = RedisSyncService.__new__(RedisSyncService)
+    service.logger = logging.getLogger("test-service-incomplete-stop")
+    service.running = True
+    service.shutdown_event = threading.Event()
+    service.incremental_service = StuckIncrementalService()
+    service.sync_tasks = []
+    service.target_connections = {}
+    service.orchestrators = {}
+    service.source_conn = None
+    service.executor = MagicMock()
+    service.web_ui = None
+
+    with pytest.raises(RuntimeError, match="实时复制线程未退出"):
+        service.stop()
 
 
 def test_stop_waits_for_inflight_start_and_prevents_service_resurrection():
@@ -182,7 +248,59 @@ def test_stop_waits_for_inflight_start_and_prevents_service_resurrection():
     service._connect_targets.assert_not_called()
     source.close.assert_called_once_with()
     source.connection_pool.disconnect.assert_called_once_with()
-    executor.shutdown.assert_called_once_with(wait=True)
+    executor.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
+
+
+def test_stop_uses_one_deadline_for_all_coordinator_joins():
+    join_timeouts = []
+
+    class StuckWorker:
+        def __init__(self, name):
+            self.name = name
+
+        def join(self, timeout):
+            join_timeouts.append(timeout)
+            time.sleep(timeout)
+
+        def is_alive(self):
+            return True
+
+    service = RedisSyncService.__new__(RedisSyncService)
+    service.logger = logging.getLogger("test-service-shared-stop-deadline")
+    service.running = True
+    service.shutdown_event = threading.Event()
+    service.incremental_service = None
+    service.sync_tasks = [StuckWorker("one"), StuckWorker("two")]
+    service.target_connections = {}
+    service.orchestrators = {}
+    service.source_conn = None
+    service.executor = MagicMock()
+    service.web_ui = None
+
+    started_at = time.monotonic()
+    with pytest.raises(RuntimeError, match="同步协调线程未退出"):
+        service.stop(timeout=0.05)
+    elapsed = time.monotonic() - started_at
+
+    assert elapsed < 0.2
+    assert sum(join_timeouts) <= 0.06
+    service.executor.shutdown.assert_called_once_with(
+        wait=False, cancel_futures=True
+    )
+
+
+def test_concurrent_stop_wait_uses_its_own_bounded_deadline():
+    service = RedisSyncService.__new__(RedisSyncService)
+    service.logger = logging.getLogger("test-concurrent-service-stop-deadline")
+    service._lifecycle_lock = threading.RLock()
+    service._stop_complete = threading.Event()
+    service._stopped = True
+
+    started_at = time.monotonic()
+    with pytest.raises(RuntimeError, match="等待现有停止流程超时"):
+        service.stop(timeout=0.02)
+
+    assert time.monotonic() - started_at < 0.2
 
 
 def test_realtime_recovery_closes_prepared_target_when_stop_wins():
@@ -362,8 +480,9 @@ def test_source_connection_uses_service_retry_configuration(monkeypatch):
     source_client = object()
 
     class FakeConnectionManager:
-        def __init__(self, retry_config=None):
+        def __init__(self, retry_config=None, shutdown_event=None):
             captured["retry_config"] = retry_config
+            captured["shutdown_event"] = shutdown_event
 
         def connect_source(self, **kwargs):
             captured["connection_kwargs"] = kwargs
@@ -388,11 +507,13 @@ def test_source_connection_uses_service_retry_configuration(monkeypatch):
         },
         "service": {"retry": retry_config},
     }
+    service.shutdown_event = threading.Event()
     service.logger = logging.getLogger("test-source-connect-retry")
 
     assert service._connect_source() is True
     assert service.source_conn is source_client
     assert captured["retry_config"] is retry_config
+    assert captured["shutdown_event"] is service.shutdown_event
     assert captured["connection_kwargs"] == {
         "host": "source.example",
         "port": 6380,
@@ -484,6 +605,29 @@ def test_realtime_target_success_updates_status_and_resets_failures(monkeypatch)
     assert status["consecutive_failures"] == 0
     assert status["last_error"] is None
     assert status["healthy"] is True
+
+
+def test_service_status_reports_replication_stall_despite_green_target_stats():
+    service = RedisSyncService.__new__(RedisSyncService)
+    service.running = True
+    service.stats = {"target-a": sync_service_module.SyncStats(is_healthy=True)}
+    service.incremental_service = SimpleNamespace(
+        get_replication_status=lambda: {
+            "running": True,
+            "healthy": False,
+            "stalled": True,
+            "callback_in_flight": True,
+            "callback_duration": 12.0,
+            "last_error": None,
+        }
+    )
+
+    status = service.get_status()
+
+    assert status["running"] is True
+    assert status["targets"]["target-a"]["healthy"] is True
+    assert status["replication"]["stalled"] is True
+    assert status["healthy"] is False
 
 
 def test_successful_realtime_recovery_resets_failure_window():
@@ -1034,6 +1178,79 @@ def test_service_config_rejects_top_level_web_ui_typo(tmp_path):
 
     with pytest.raises(ConfigurationError, match=r"配置顶层.*web_iu"):
         load_and_validate_service_config(_write_service_config(tmp_path, config))
+
+
+@pytest.mark.parametrize("api_key", [None, ""], ids=["null-key", "empty-key"])
+def test_service_config_allows_external_web_bind_with_loopback_only_acl(
+    tmp_path, api_key
+):
+    config = _service_config()
+    config["web_ui"] = {"enabled": True, "host": "0.0.0.0"}
+    config["security"] = {
+        "auth_enabled": False,
+        "api_key": api_key,
+        "allowed_ips": ["127.0.0.1", "::1"],
+    }
+
+    loaded = load_and_validate_service_config(_write_service_config(tmp_path, config))
+
+    assert loaded["web_ui"]["host"] == "0.0.0.0"
+    assert loaded["security"]["allowed_ips"] == ["127.0.0.1", "::1"]
+
+
+def test_service_config_allows_external_web_bind_with_api_key(tmp_path):
+    config = _service_config()
+    config["web_ui"] = {"enabled": True, "host": "0.0.0.0"}
+    config["security"] = {
+        "auth_enabled": True,
+        "api_key": "secret",
+        "allowed_ips": ["10.0.0.0/8"],
+    }
+
+    loaded = load_and_validate_service_config(_write_service_config(tmp_path, config))
+
+    assert loaded["security"]["auth_enabled"] is True
+
+
+@pytest.mark.parametrize(
+    "allowed_ips",
+    [
+        None,
+        [],
+        ["*"],
+        ["10.0.0.0/8"],
+        ["127.0.0.1", "not-a-network"],
+        ["127.0.0.1", "   "],
+    ],
+    ids=[
+        "missing",
+        "empty",
+        "wildcard",
+        "non-loopback",
+        "invalid",
+        "blank",
+    ],
+)
+def test_service_config_rejects_unprotected_external_web_bind(
+    tmp_path, allowed_ips
+):
+    config = _service_config()
+    config["web_ui"] = {"enabled": True, "host": "0.0.0.0"}
+    config["security"] = {"auth_enabled": False}
+    if allowed_ips is not None:
+        config["security"]["allowed_ips"] = allowed_ips
+
+    with pytest.raises(ConfigurationError, match=r"Web UI|allowed_ips"):
+        load_and_validate_service_config(_write_service_config(tmp_path, config))
+
+
+def test_service_config_ignores_web_exposure_policy_when_web_is_disabled(tmp_path):
+    config = _service_config()
+    config["web_ui"] = {"enabled": False, "host": "0.0.0.0"}
+
+    loaded = load_and_validate_service_config(_write_service_config(tmp_path, config))
+
+    assert loaded["web_ui"]["enabled"] is False
 
 
 def test_service_config_normalizes_and_validates_key_types(tmp_path):

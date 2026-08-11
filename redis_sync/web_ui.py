@@ -12,8 +12,11 @@ import ipaddress
 import json
 import threading
 import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
+
+
+DEFAULT_MAX_REQUEST_WORKERS = 32
 
 
 _SENSITIVE_CONFIG_FIELDS = {
@@ -356,6 +359,10 @@ h1 {
     background-color: #27ae60;
 }
 
+.status-dot.degraded {
+    background-color: #f39c12;
+}
+
 .status-dot.stopped {
     background-color: #e74c3c;
 }
@@ -507,16 +514,21 @@ class Dashboard {
         const statusDot = statusIndicator.querySelector('.status-dot');
         const statusText = statusIndicator.querySelector('.status-text');
         
-        if (status.running) {
+        if (status.running && status.healthy === true) {
             statusDot.className = 'status-dot running';
-            statusText.textContent = '运行中';
+            statusText.textContent = '运行健康';
+        } else if (status.running) {
+            statusDot.className = 'status-dot degraded';
+            statusText.textContent = '运行异常';
         } else {
             statusDot.className = 'status-dot stopped';
             statusText.textContent = '已停止';
         }
         
         // 更新概览统计
-        document.getElementById('runningStatus').textContent = status.running ? '运行中' : '已停止';
+        document.getElementById('runningStatus').textContent = !status.running
+            ? '已停止'
+            : (status.healthy === true ? '运行中' : '异常');
         document.getElementById('targetCount').textContent = Object.keys(status.targets).length;
         
         const healthyCount = Object.values(status.targets).filter(t => t.healthy).length;
@@ -604,37 +616,176 @@ document.addEventListener('DOMContentLoaded', () => {
         pass
 
 
+class _ConcurrentHTTPServer(ThreadingHTTPServer):
+    """Serve clients independently with bounded request concurrency."""
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(
+        self,
+        *args,
+        request_timeout=5.0,
+        max_workers=DEFAULT_MAX_REQUEST_WORKERS,
+        **kwargs,
+    ):
+        self.request_timeout = float(request_timeout)
+        if self.request_timeout <= 0:
+            raise ValueError("request_timeout must be greater than zero")
+        if isinstance(max_workers, bool):
+            raise ValueError("max_workers must be a positive integer")
+        self.max_workers = int(max_workers)
+        if self.max_workers <= 0 or self.max_workers != max_workers:
+            raise ValueError("max_workers must be a positive integer")
+        self._request_slots = threading.BoundedSemaphore(self.max_workers)
+        super().__init__(*args, **kwargs)
+
+    def get_request(self):
+        request, client_address = super().get_request()
+        try:
+            request.settimeout(self.request_timeout)
+        except Exception:
+            request.close()
+            raise
+        return request, client_address
+
+    def process_request(self, request, client_address):
+        if not self._request_slots.acquire(blocking=False):
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Connection: close\r\n"
+                    b"Content-Length: 0\r\n"
+                    b"Retry-After: 1\r\n\r\n"
+                )
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._request_slots.release()
+            self.shutdown_request(request)
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
+
+
 class WebUI:
     """Web UI服务器"""
     
-    def __init__(self, sync_service, host='127.0.0.1', port=8080):
+    def __init__(
+        self,
+        sync_service,
+        host='127.0.0.1',
+        port=8080,
+        request_timeout=5.0,
+        max_request_workers=DEFAULT_MAX_REQUEST_WORKERS,
+    ):
         self.sync_service = sync_service
         self.host = host
         self.port = port
+        self.request_timeout = request_timeout
+        self.max_request_workers = max_request_workers
         self.server = None
         self.server_thread = None
+        self._stop_state_lock = threading.Lock()
+        self._shutdown_helper = None
+        self._close_helper = None
     
     def start(self):
         """启动Web UI服务器"""
         def handler(*args, **kwargs):
             return WebUIHandler(self.sync_service, *args, **kwargs)
         
-        self.server = HTTPServer((self.host, self.port), handler)
-        self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.server = _ConcurrentHTTPServer(
+            (self.host, self.port),
+            handler,
+            request_timeout=self.request_timeout,
+            max_workers=self.max_request_workers,
+        )
+        self.server_thread = threading.Thread(
+            target=self.server.serve_forever,
+            kwargs={'poll_interval': 0.1},
+            daemon=True,
+        )
         self.server_thread.start()
         
         print(f"Web UI启动成功: http://{self.host}:{self.port}")
     
-    def stop(self):
+    def stop(self, timeout=5.0):
         """停止Web UI服务器"""
-        if self.server:
-            self.server.shutdown()
-            self.server.server_close()
-        
-        if self.server_thread:
-            self.server_thread.join(timeout=5)
-        
-        print("Web UI已停止")
+        deadline = time.monotonic() + max(0.0, float(timeout))
+
+        def remaining():
+            return max(0.0, deadline - time.monotonic())
+
+        with self._stop_state_lock:
+            server = self.server
+            server_thread = self.server_thread
+            shutdown_helper = self._shutdown_helper
+            close_helper = self._close_helper
+
+            if server is not None and shutdown_helper is None:
+                shutdown_helper = threading.Thread(
+                    target=server.shutdown,
+                    name="redis-sync-web-shutdown",
+                    daemon=True,
+                )
+                self._shutdown_helper = shutdown_helper
+                shutdown_helper.start()
+
+        if shutdown_helper is not None:
+            shutdown_helper.join(timeout=remaining())
+
+        with self._stop_state_lock:
+            if server is not None and self._close_helper is None:
+                close_helper = threading.Thread(
+                    target=server.server_close,
+                    name="redis-sync-web-close",
+                    daemon=True,
+                )
+                self._close_helper = close_helper
+                close_helper.start()
+            else:
+                close_helper = self._close_helper
+
+        if close_helper is not None:
+            close_helper.join(timeout=remaining())
+
+        if server_thread is not None:
+            try:
+                server_thread.join(timeout=remaining())
+            except RuntimeError:
+                # A partially failed start can leave an unstarted thread object.
+                pass
+
+        shutdown_stopped = (
+            shutdown_helper is None or not shutdown_helper.is_alive()
+        )
+        close_stopped = close_helper is None or not close_helper.is_alive()
+        server_stopped = server_thread is None or not server_thread.is_alive()
+        stopped = shutdown_stopped and close_stopped and server_stopped
+
+        if stopped:
+            with self._stop_state_lock:
+                if self.server is server:
+                    self.server = None
+                    self.server_thread = None
+                    self._shutdown_helper = None
+                    self._close_helper = None
+
+        if stopped:
+            print("Web UI已停止")
+        else:
+            print("Web UI停止未完成")
+        return stopped
 
 
 if __name__ == '__main__':

@@ -21,11 +21,7 @@ from .key_sync import (
     _is_busykey_error,
     _is_restore_compatibility_error,
     _sync_key_fallback,
-    cache_source_pexpiretime_support,
-    capture_dump_with_preflight,
-    is_pexpiretime_capability_error,
     restore_dump_with_deadline,
-    source_supports_pexpiretime,
 )
 from .sync_filters import (
     KeySyncFilter,
@@ -37,6 +33,91 @@ from .utils import ProgressTracker, format_bytes, format_duration
 
 logger = logging.getLogger(__name__)
 MAX_PIPELINE_KEYS = 200
+
+
+ATOMIC_SOURCE_CAPTURE_LUA = b"""
+local preserve_ttl = tonumber(ARGV[1]) == 1
+local min_ttl_ms = tonumber(ARGV[2]) or 0
+local max_key_size = tonumber(ARGV[3]) or 0
+local batch_budget = tonumber(ARGV[4]) or 0
+local type_count = tonumber(ARGV[5]) or 0
+local now_ms = -1
+if preserve_ttl then
+    local now = redis.pcall('TIME')
+    if type(now) == 'table' and not now['err'] and #now >= 2 then
+        now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
+    end
+end
+local captured_payload_bytes = 0
+local result = {}
+
+for _, key in ipairs(KEYS) do
+    local pttl = redis.call('PTTL', key)
+    if pttl == -2 or pttl == 0 then
+        result[#result + 1] = {0}
+    else
+        local allowed = true
+        local key_type = ''
+        if type_count > 0 then
+            local type_reply = redis.call('TYPE', key)
+            key_type = type_reply
+            if type(type_reply) == 'table' then
+                key_type = type_reply['ok']
+            end
+            allowed = false
+            for index = 1, type_count do
+                if key_type == ARGV[5 + index] then
+                    allowed = true
+                    break
+                end
+            end
+        end
+
+        if allowed and min_ttl_ms > 0 and pttl > 0 and pttl < min_ttl_ms then
+            allowed = false
+        end
+
+        local memory_reply = redis.pcall('MEMORY', 'USAGE', key)
+        local memory_error = type(memory_reply) == 'table' and memory_reply['err']
+        local memory_size = -1
+        if not memory_error and memory_reply then
+            memory_size = tonumber(memory_reply)
+        end
+
+        if memory_error then
+            result[#result + 1] = {4, tostring(memory_error)}
+        elseif not memory_error and not memory_reply then
+            result[#result + 1] = {0}
+        elseif allowed and max_key_size > 0 and memory_size > max_key_size then
+            result[#result + 1] = {1}
+        elseif not allowed then
+            result[#result + 1] = {1}
+        elseif memory_size > 0 and batch_budget > 0 and captured_payload_bytes > 0
+                and captured_payload_bytes + memory_size > batch_budget then
+            result[#result + 1] = {3}
+        else
+            local dump_data = redis.call('DUMP', key)
+            if not dump_data then
+                result[#result + 1] = {0}
+            elseif batch_budget > 0 and captured_payload_bytes > 0
+                    and captured_payload_bytes + string.len(dump_data) > batch_budget then
+                result[#result + 1] = {3}
+            else
+                local expires_at_ms = -1
+                if preserve_ttl and pttl > 0 and now_ms > 0 then
+                    expires_at_ms = now_ms + pttl
+                end
+                captured_payload_bytes = captured_payload_bytes + string.len(dump_data)
+                result[#result + 1] = {
+                    2, dump_data, pttl, expires_at_ms, key_type, memory_size
+                }
+            end
+        end
+    end
+end
+
+return result
+""".strip()
 
 
 def _bounded_pipeline_batch_size(batch_size: int) -> int:
@@ -560,42 +641,9 @@ class FullMigrationHandler:
             operation_name = 'filtered_delete' if has_dynamic_filters else 'delete'
             queue_operation((operation_name, key, None, None, False))
 
-        capture_groups = (
-            [[key] for key in candidates]
-            if max_key_size > 0
-            else self._plan_source_capture_groups(candidates)
-        )
-        for group in capture_groups:
-            self._raise_if_cancelled()
-            try:
-                if len(group) == 1:
-                    captured_states = [
-                        capture_dump_with_preflight(
-                            self.source_client,
-                            group[0],
-                            preserve_ttl=preserve_ttl,
-                            key_types=key_types,
-                            min_ttl=min_ttl,
-                            max_key_size=max_key_size,
-                        )
-                    ]
-                else:
-                    captured_states = self._capture_dump_group(
-                        group,
-                        preserve_ttl=preserve_ttl,
-                        key_types=key_types,
-                        min_ttl=min_ttl,
-                    )
-            except Exception as error:
-                logger.error(
-                    "DUMP/PTTL批量读取失败 keys=%d: %s",
-                    len(group),
-                    error,
-                )
-                failed += len(group)
-                continue
-
-            for key, captured in zip(group, captured_states):
+        def consume_captured_batch(batch) -> None:
+            nonlocal failed
+            for key, captured in batch:
                 if isinstance(captured, BaseException):
                     logger.error("DUMP/PTTL读取失败 key=%r: %s", key, captured)
                     failed += 1
@@ -612,79 +660,40 @@ class FullMigrationHandler:
                         captured.expiry_is_exact,
                     )
                 )
-            if max_key_size <= 0:
-                # Do not retain one source group's payloads while the next
-                # group is being materialized.
-                flush_operations()
+
+        group = candidates
+        self._raise_if_cancelled()
+        capture_batches = self._capture_dump_group(
+            group,
+            preserve_ttl=preserve_ttl,
+            key_types=key_types,
+            min_ttl=min_ttl,
+            max_key_size=max_key_size,
+        )
+        captured_count = 0
+        while True:
+            try:
+                captured_batch = next(capture_batches)
+            except StopIteration:
+                break
+            except Exception as error:
+                logger.error(
+                    "DUMP/PTTL批量读取失败 keys=%d: %s",
+                    len(group) - captured_count,
+                    error,
+                )
+                failed += max(0, len(group) - captured_count)
+                break
+
+            captured_count += len(captured_batch)
+            consume_captured_batch(captured_batch)
+            # Release this EVAL response before requesting the deferred round.
+            flush_operations()
+            del captured_batch
 
         self._raise_if_cancelled()
         flush_operations()
         return {'migrated': migrated, 'failed': failed, 'skipped': skipped}
-
-    def _plan_source_capture_groups(self, keys: List[bytes]) -> List[List[bytes]]:
-        """Group source DUMPs by MEMORY USAGE without retaining their payloads."""
-        candidates = list(keys)
-        if len(candidates) <= 1:
-            return [candidates] if candidates else []
-
-        try:
-            pipe = self.source_client.pipeline(transaction=False)
-            for key in candidates:
-                pipe.execute_command('MEMORY', 'USAGE', key)
-            memory_results = _execute_pipeline_allowing_errors(pipe)
-        except Exception as error:
-            logger.warning(
-                "MEMORY USAGE批量预检失败，退回逐键捕获: %s",
-                error,
-            )
-            return [[key] for key in candidates]
-
-        if len(memory_results) != len(candidates):
-            logger.warning(
-                "MEMORY USAGE响应数量不匹配，退回逐键捕获: %d != %d",
-                len(memory_results),
-                len(candidates),
-            )
-            return [[key] for key in candidates]
-
-        groups = []
-        current_group = []
-        current_bytes = 0
-
-        def flush_group() -> None:
-            nonlocal current_group
-            nonlocal current_bytes
-            if current_group:
-                groups.append(current_group)
-                current_group = []
-                current_bytes = 0
-
-        for key, raw_size in zip(candidates, memory_results):
-            if (
-                isinstance(raw_size, BaseException)
-                or isinstance(raw_size, bool)
-                or not isinstance(raw_size, int)
-                or raw_size <= 0
-            ):
-                flush_group()
-                groups.append([key])
-                continue
-
-            if current_group and (
-                len(current_group) >= MAX_PIPELINE_KEYS
-                or current_bytes + raw_size > MAX_DUMP_BATCH_BYTES
-            ):
-                flush_group()
-            current_group.append(key)
-            current_bytes += raw_size
-            if (
-                len(current_group) >= MAX_PIPELINE_KEYS
-                or current_bytes >= MAX_DUMP_BATCH_BYTES
-            ):
-                flush_group()
-
-        flush_group()
-        return groups
 
     def _capture_dump_group(
         self,
@@ -693,165 +702,164 @@ class FullMigrationHandler:
         preserve_ttl: bool,
         key_types: Optional[List[str]],
         min_ttl: int,
-        _use_pexpiretime: Optional[bool] = None,
+        max_key_size: int,
     ):
-        """Atomically capture one pre-sized group in a single source RTT."""
-        needs_type = bool(key_types)
-        has_pexpiretime = preserve_ttl and (
-            source_supports_pexpiretime(self.source_client, keys[0])
-            if _use_pexpiretime is None
-            else _use_pexpiretime
-        )
-        pipe = self.source_client.pipeline(transaction=True)
-        retry_without_pexpiretime = False
-        try:
-            for key in keys:
-                pipe.dump(key)
-                pipe.pttl(key)
-                if has_pexpiretime:
-                    pipe.execute_command('PEXPIRETIME', key)
-                if needs_type:
-                    pipe.type(key)
+        """Yield each atomically captured round before requesting deferred keys."""
+        allowed_types = list(key_types or [])
+        pending = list(keys)
+
+        while pending:
+            self._raise_if_cancelled()
+            pipe = self.source_client.pipeline(transaction=False)
+            pipe.execute_command(
+                'EVAL',
+                ATOMIC_SOURCE_CAPTURE_LUA,
+                len(pending),
+                *pending,
+                int(bool(preserve_ttl)),
+                max(0, int(min_ttl)) * 1000,
+                max(0, int(max_key_size)),
+                MAX_DUMP_BATCH_BYTES,
+                len(allowed_types),
+                *allowed_types,
+            )
             sample_started_ns = time.monotonic_ns()
             raw = _execute_pipeline_allowing_errors(pipe)
-        except Exception as error:
-            if has_pexpiretime and is_pexpiretime_capability_error(error):
-                cache_source_pexpiretime_support(self.source_client, False)
-                retry_without_pexpiretime = True
-            else:
-                raise
-        finally:
-            reset = getattr(pipe, 'reset', None)
-            if callable(reset):
-                try:
-                    reset()
-                except Exception:
-                    pass
+            elapsed_ms = (
+                max(0, time.monotonic_ns() - sample_started_ns) + 999_999
+            ) // 1_000_000
 
-        if retry_without_pexpiretime:
-            return self._capture_dump_group(
-                keys,
-                preserve_ttl=preserve_ttl,
-                key_types=key_types,
-                min_ttl=min_ttl,
-                _use_pexpiretime=False,
-            )
-
-        stride = 2 + int(has_pexpiretime) + int(needs_type)
-        expected = len(keys) * stride
-        if len(raw) != expected:
-            raise RuntimeError(
-                f"source capture response count mismatch: {len(raw)} != {expected}"
-            )
-
-        if has_pexpiretime:
-            expiry_responses = [
-                raw[index * stride + 2]
-                for index in range(len(keys))
-            ]
-            expiry_error = next(
-                (
-                    value
-                    for value in expiry_responses
-                    if isinstance(value, BaseException)
-                ),
-                None,
-            )
-            if expiry_error is not None:
-                if not isinstance(expiry_error, redis.ResponseError):
-                    raise expiry_error
-                cache_source_pexpiretime_support(self.source_client, False)
-                del raw
-                return self._capture_dump_group(
-                    keys,
-                    preserve_ttl=preserve_ttl,
-                    key_types=key_types,
-                    min_ttl=min_ttl,
-                    _use_pexpiretime=False,
+            if len(raw) != 1:
+                raise RuntimeError(
+                    f"source capture response count mismatch: {len(raw)} != 1"
+                )
+            replies = raw[0]
+            if isinstance(replies, BaseException):
+                raise replies
+            if not isinstance(replies, (list, tuple)):
+                raise RuntimeError(
+                    f"invalid source capture response: {replies!r}"
+                )
+            if len(replies) != len(pending):
+                raise RuntimeError(
+                    "source capture key count mismatch: "
+                    f"{len(replies)} != {len(pending)}"
                 )
 
-        observed_at_ms = int(time.time() * 1000)
-        elapsed_ms = (
-            max(0, time.monotonic_ns() - sample_started_ns) + 999_999
-        ) // 1_000_000
-        captured_states = []
-        for index, key in enumerate(keys):
-            base = index * stride
-            dump_data = raw[base]
-            pttl = raw[base + 1]
-            next_index = base + 2
-            pexpiretime = raw[next_index] if has_pexpiretime else None
-            next_index += int(has_pexpiretime)
-            key_type = raw[next_index] if needs_type else None
-
-            responses = (dump_data, pttl, key_type)
-            error = next(
-                (
-                    response
-                    for response in responses
-                    if isinstance(response, BaseException)
-                ),
-                None,
-            )
-            if error is not None:
-                captured_states.append(error)
-                continue
-            if dump_data is None:
-                captured_states.append(None)
-                continue
-            try:
-                ttl_ms = int(pttl)
-            except (TypeError, ValueError):
-                captured_states.append(
-                    ValueError(f"invalid PTTL response: {pttl!r}")
-                )
-                continue
-            if ttl_ms in (-2, 0):
-                captured_states.append(None)
-                continue
-            if ttl_ms < -2:
-                captured_states.append(
-                    ValueError(f"invalid PTTL response: {ttl_ms}")
-                )
-                continue
-
-            expires_at_ms = None
-            expiry_is_exact = False
-            remaining_ttl_ms = ttl_ms
-            if ttl_ms > 0:
-                remaining_ttl_ms = ttl_ms - elapsed_ms
-                if remaining_ttl_ms <= 0:
-                    captured_states.append(None)
+            deferred = []
+            captured_batch = []
+            dump_data = None
+            reply = None
+            for key, reply in zip(pending, replies):
+                if not isinstance(reply, (list, tuple)) or not reply:
+                    captured_batch.append(
+                        (
+                            key,
+                            RuntimeError(
+                                f"invalid source capture row for {key!r}: {reply!r}"
+                            ),
+                        )
+                    )
                     continue
                 try:
-                    absolute_ms = int(pexpiretime)
+                    status = int(reply[0])
                 except (TypeError, ValueError):
-                    absolute_ms = -1
-                if preserve_ttl and absolute_ms > 0:
-                    expires_at_ms = absolute_ms
-                    expiry_is_exact = True
-                elif preserve_ttl:
-                    expires_at_ms = observed_at_ms + remaining_ttl_ms
+                    captured_batch.append(
+                        (
+                            key,
+                            RuntimeError(
+                                f"invalid source capture status for {key!r}: {reply!r}"
+                            ),
+                        )
+                    )
+                    continue
 
-            if not source_state_in_dynamic_scope(
-                remaining_ttl_ms,
-                key_type=key_type,
-                key_types=key_types,
-                min_ttl=min_ttl,
-            ):
-                captured_states.append(None)
-                continue
-            captured_states.append(
-                CapturedDumpState(
-                    dump_data=dump_data,
-                    pttl_ms=ttl_ms,
-                    expires_at_ms=expires_at_ms,
-                    remaining_ttl_ms=remaining_ttl_ms,
+                if status == 3:
+                    deferred.append(key)
+                    continue
+                if status == 4:
+                    detail = reply[1] if len(reply) > 1 else "MEMORY USAGE failed"
+                    captured_batch.append((key, RuntimeError(str(detail))))
+                    continue
+                if status in (0, 1):
+                    captured_batch.append((key, None))
+                    continue
+                if status != 2 or len(reply) != 6:
+                    captured_batch.append(
+                        (
+                            key,
+                            RuntimeError(
+                                f"invalid source capture row for {key!r}: {reply!r}"
+                            ),
+                        )
+                    )
+                    continue
+
+                dump_data, pttl, expires_at, key_type, memory_size = reply[1:]
+                try:
+                    ttl_ms = int(pttl)
+                    absolute_ms = int(expires_at)
+                    memory_bytes = int(memory_size)
+                except (TypeError, ValueError):
+                    captured_batch.append(
+                        (
+                            key,
+                            ValueError(
+                                f"invalid source capture values for {key!r}: {reply!r}"
+                            ),
+                        )
+                    )
+                    continue
+                remaining_ttl_ms = ttl_ms
+                if ttl_ms > 0:
+                    remaining_ttl_ms -= elapsed_ms
+                    if remaining_ttl_ms <= 0:
+                        captured_batch.append((key, None))
+                        continue
+                if not source_state_in_dynamic_scope(
+                    remaining_ttl_ms,
                     key_type=key_type,
-                    expiry_is_exact=expiry_is_exact,
+                    memory_size=memory_bytes,
+                    key_types=allowed_types,
+                    min_ttl=min_ttl,
+                    max_key_size=max_key_size,
+                ):
+                    captured_batch.append((key, None))
+                    continue
+                expires_at_ms = None
+                expiry_is_exact = False
+                if preserve_ttl and ttl_ms > 0:
+                    if absolute_ms > 0:
+                        expires_at_ms = absolute_ms
+                        expiry_is_exact = True
+                    else:
+                        expires_at_ms = (
+                            int(time.time() * 1000) + remaining_ttl_ms
+                        )
+                captured_memory = (
+                    memory_bytes if memory_bytes >= 0 else None
                 )
-            )
-        return captured_states
+                captured_batch.append(
+                    (
+                        key,
+                        CapturedDumpState(
+                            dump_data=dump_data,
+                            pttl_ms=ttl_ms,
+                            expires_at_ms=expires_at_ms,
+                            remaining_ttl_ms=remaining_ttl_ms,
+                            key_type=key_type or None,
+                            memory_size=captured_memory,
+                            expiry_is_exact=expiry_is_exact,
+                        ),
+                    )
+                )
+
+            if deferred and not captured_batch:
+                raise RuntimeError("source capture made no progress")
+            del raw, replies, reply, dump_data
+            yield captured_batch
+            del captured_batch
+            pending = deferred
 
     def _write_dump_operations(
         self,

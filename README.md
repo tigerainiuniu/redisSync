@@ -229,7 +229,8 @@ web_ui:
 - `clear_target: false` 保留目标端仅有的键；`clear_target: true` 在复制前对目标数据库执行 `FLUSHDB`，包括过滤范围外的键
 - 验证默认使用 `verify_mode: full`，对验证样本比较键的存在性、类型、值和 TTL。显式设置 `fast` 时仅检查存在性和类型结构，同类型但值不同的键会被视为匹配
 - `migration.scan_count`、`sync.full_sync.scan_count` 与 `service.performance.scan_count` 建议设置为 5000-20000，硬上限为 100000；更大的 SCAN 页会被配置校验拒绝
-- 源端 DUMP 捕获和目标端 RESTORE 管道均按最多 200 键、累计约 16 MiB 进行分组；配置 `max_key_size` 时会先通过 `MEMORY USAGE` 预检，超限键不会被 DUMP 物化
+- 源端每次最多对 200 个键执行单次原子 `EVAL`：脚本先检查 `PTTL` 和 `MEMORY USAGE`，配置类型过滤时再检查 `TYPE`，最后对合格键执行 `DUMP`；超限键不会被 DUMP 物化，实际 DUMP payload 按约 16 MiB 分轮返回，并在请求下一轮前写入目标。单个键可超过分轮值，但仍受 `max_key_size` 约束
+- 源端 Redis ACL 需允许 `EVAL`、`PTTL`、`MEMORY USAGE` 和 `DUMP`，使用类型过滤时还需允许 `TYPE`。允许 `TIME` 时使用源端绝对过期时间；`TIME` 受限时按响应耗时扣减 TTL 后生成保守截止时间。目标端 RESTORE 管道同样限制为最多 200 键、累计约 16 MiB
 
 ### 增量同步 (Incremental Sync)
 - **psync（推荐）**：使用 Redis PSYNC 复制流；无法续传时接收 RDB 快照并重新对齐目标

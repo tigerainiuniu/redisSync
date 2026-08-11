@@ -1,5 +1,7 @@
+import gc
 import threading
 import time
+import weakref
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -22,6 +24,22 @@ def _pipeline(results=None, error=None):
     else:
         pipe.execute.return_value = results or []
     return pipe
+
+
+def _atomic_capture_pipeline(
+    dump_data=b"dump",
+    pttl=-1,
+    expires_at=-1,
+    key_type=b"",
+    memory_size=4,
+    status=2,
+):
+    row = (
+        [status]
+        if status != 2
+        else [2, dump_data, pttl, expires_at, key_type, memory_size]
+    )
+    return _pipeline([[row]])
 
 
 def _watched_pipeline(results, *, key_type=b"string", value=None, values=None):
@@ -322,7 +340,7 @@ def test_full_batch_skips_existing_key_without_overwrite():
 
 def test_full_batch_overwrites_only_when_enabled():
     source = MagicMock()
-    source.pipeline.return_value = _pipeline([b"dump", -1])
+    source.pipeline.return_value = _atomic_capture_pipeline()
     target = MagicMock()
     write_pipe = _pipeline([b"OK"])
     target.pipeline.return_value = write_pipe
@@ -339,7 +357,7 @@ def test_full_batch_overwrites_only_when_enabled():
 
 def test_full_batch_deducts_pipeline_delay_from_pttl(monkeypatch):
     source = MagicMock()
-    source.pipeline.return_value = _pipeline([b"dump", 250])
+    source.pipeline.return_value = _atomic_capture_pipeline(pttl=250)
     target = MagicMock()
     write_pipe = _pipeline([b"OK"])
     target.pipeline.return_value = write_pipe
@@ -365,7 +383,7 @@ def test_full_batch_deducts_pipeline_delay_from_pttl(monkeypatch):
 
 def test_full_batch_deletes_key_that_expires_before_write(monkeypatch):
     source = MagicMock()
-    source.pipeline.return_value = _pipeline([b"dump", 100])
+    source.pipeline.return_value = _atomic_capture_pipeline(pttl=100)
     target = MagicMock()
     write_pipe = _pipeline([1])
     target.pipeline.return_value = write_pipe
@@ -389,7 +407,7 @@ def test_full_batch_deletes_key_that_expires_before_write(monkeypatch):
 
 def test_full_batch_uses_single_key_fallback_for_restore_compatibility(monkeypatch):
     source = MagicMock()
-    source.pipeline.return_value = _pipeline([b"dump", -1])
+    source.pipeline.return_value = _atomic_capture_pipeline()
     target = MagicMock()
     target.pipeline.return_value = _pipeline(
         [redis.ResponseError("ERR DUMP payload version or checksum are wrong")]
@@ -421,19 +439,19 @@ def test_full_batch_uses_single_key_fallback_for_restore_compatibility(monkeypat
 
 
 @pytest.mark.parametrize(
-    ("results", "key_types", "key_filter"),
+    ("source_pipelines", "key_types", "key_filter"),
     [
-        ([b"dump", -1, b"list"], ["string"], None),
-        ([b"dump", 10_000], None, KeySyncFilter(min_ttl=60)),
-        ([b"dump", -1, 100], None, KeySyncFilter(max_key_size=10)),
+        ([_atomic_capture_pipeline(status=1)], ["string"], None),
+        ([_atomic_capture_pipeline(status=1)], None, KeySyncFilter(min_ttl=60)),
+        ([_atomic_capture_pipeline(status=1)], None, KeySyncFilter(max_key_size=10)),
     ],
     ids=["wrong-type", "low-ttl", "oversized"],
 )
 def test_full_batch_atomically_rechecks_dynamic_scope_before_restore(
-    results, key_types, key_filter
+    source_pipelines, key_types, key_filter
 ):
     source = MagicMock()
-    source.pipeline.return_value = _pipeline(results)
+    source.pipeline.side_effect = source_pipelines
     target = MagicMock()
     write_pipe = _pipeline([1])
     target.pipeline.return_value = write_pipe
@@ -508,10 +526,12 @@ def test_full_migration_keeps_name_filters_before_atomic_capture(strategy):
     handler._dump_restore_batch.assert_not_called()
 
 
-def test_full_batch_uses_exact_source_pexpiretime(monkeypatch):
+def test_full_batch_uses_exact_source_time_deadline(monkeypatch):
     source = MagicMock()
-    source.execute_command.return_value = 102_500
-    source.pipeline.return_value = _pipeline([b"dump", 2500, 102_500])
+    source.pipeline.return_value = _atomic_capture_pipeline(
+        pttl=2500,
+        expires_at=102_500,
+    )
     target = MagicMock()
     write_pipe = _pipeline([b"OK"])
     target.pipeline.return_value = write_pipe
@@ -533,17 +553,13 @@ def test_full_batch_uses_exact_source_pexpiretime(monkeypatch):
     )
 
 
-def test_full_batch_pexpiretime_error_falls_back_to_pttl(monkeypatch):
+def test_full_batch_source_time_error_falls_back_to_pttl(monkeypatch):
     source = MagicMock()
-    source.execute_command.return_value = 102_500
-    source.pipeline.side_effect = [
-        _pipeline([b"dump", 250, redis.ResponseError("NOPERM PEXPIRETIME")]),
-        _pipeline([b"dump", 250]),
-    ]
+    source.pipeline.return_value = _atomic_capture_pipeline(pttl=250)
     target = MagicMock()
     write_pipe = _pipeline([b"OK"])
     target.pipeline.return_value = write_pipe
-    monotonic_values = iter([0, 0, 100_000_000])
+    monotonic_values = iter([0, 100_000_000])
     monkeypatch.setattr(
         full_migration_module.time,
         "monotonic_ns",
@@ -563,8 +579,7 @@ def test_full_batch_pexpiretime_error_falls_back_to_pttl(monkeypatch):
 
 def test_full_batch_old_target_reuses_captured_dump_and_deadline(monkeypatch):
     source = MagicMock()
-    source.execute_command.side_effect = redis.ResponseError("unknown command")
-    source.pipeline.return_value = _pipeline([b"dump", 250])
+    source.pipeline.return_value = _atomic_capture_pipeline(pttl=250)
     target = MagicMock()
     target.pipeline.return_value = _pipeline([redis.ResponseError("ERR syntax error")])
     target.pexpireat.return_value = True
@@ -591,8 +606,10 @@ def test_full_batch_old_target_reuses_captured_dump_and_deadline(monkeypatch):
 
 def test_full_batch_old_target_receives_exact_expiry_provenance(monkeypatch):
     source = MagicMock()
-    source.execute_command.return_value = 102_500
-    source.pipeline.return_value = _pipeline([b"dump", 2500, 102_500])
+    source.pipeline.return_value = _atomic_capture_pipeline(
+        pttl=2500,
+        expires_at=102_500,
+    )
     target = MagicMock()
     target.pipeline.return_value = _pipeline(
         [redis.ResponseError("ERR syntax error")]
@@ -984,7 +1001,7 @@ def test_key_sync_failed_compatibility_fallback_keeps_old_target_value():
 
 def test_full_batch_does_not_restore_expired_dump_as_persistent():
     source = MagicMock()
-    source.pipeline.return_value = _pipeline([b"dump", 0])
+    source.pipeline.return_value = _atomic_capture_pipeline(status=0)
     target = MagicMock()
     write_pipe = _pipeline([1])
     target.pipeline.return_value = write_pipe
@@ -1695,9 +1712,18 @@ class _BatchRecordingPipeline:
     def pttl(self, key):
         return self._add("pttl", key)
 
-    def execute_command(self, command, subcommand, key):
-        assert (command, subcommand) == ("MEMORY", "USAGE")
-        return self._add("memory", key)
+    def execute_command(self, *args):
+        if args[:2] == ("MEMORY", "USAGE"):
+            return self._add("memory", args[2])
+        if args[0] in ("EVAL", b"EVAL"):
+            key_count = int(args[2])
+            keys = tuple(args[3:3 + key_count])
+            if args[1] != full_migration_module.ATOMIC_SOURCE_CAPTURE_LUA:
+                assert key_count == 1
+                return self._add("delete", keys[0])
+            script_args = args[3 + key_count:]
+            return self._add("eval", keys, *script_args)
+        raise AssertionError(f"unexpected command: {args!r}")
 
     def restore(self, key, ttl, dump_data, replace=False):
         return self._add("restore", key, ttl, dump_data, replace)
@@ -1722,7 +1748,39 @@ class _BatchRecordingPipeline:
             elif command == "pttl":
                 results.append(-1)
             elif command == "memory":
-                results.append(len(b"dump:" + key))
+                results.append(
+                    self.client.memory_sizes.get(key, len(b"dump:" + key))
+                )
+            elif command == "eval":
+                preserve_ttl, min_ttl_ms, max_key_size, budget, type_count, *types = (
+                    _args
+                )
+                _ = preserve_ttl, min_ttl_ms
+                captured_bytes = 0
+                rows = []
+                for captured_key in key:
+                    memory_size = self.client.memory_sizes.get(
+                        captured_key, len(b"dump:" + captured_key)
+                    )
+                    dump_data = b"dump:" + captured_key
+                    if type_count and b"string" not in {
+                        value if isinstance(value, bytes) else str(value).encode()
+                        for value in types
+                    }:
+                        rows.append([1])
+                    elif max_key_size and memory_size > max_key_size:
+                        rows.append([1])
+                    elif captured_bytes and (
+                        captured_bytes + len(dump_data) > budget
+                    ):
+                        rows.append([3])
+                    else:
+                        rows.append(
+                            [2, dump_data, -1, -1, b"string", memory_size]
+                        )
+                        captured_bytes += len(dump_data)
+                        self.client.captured_keys.append(captured_key)
+                results.append(rows)
             elif command == "delete":
                 results.append(1)
             else:
@@ -1731,10 +1789,12 @@ class _BatchRecordingPipeline:
 
 
 class _BatchRecordingRedis:
-    def __init__(self, keys=(), existing_keys=()):
+    def __init__(self, keys=(), existing_keys=(), memory_sizes=None):
         self.keys = list(keys)
         self.existing_keys = set(existing_keys)
+        self.memory_sizes = dict(memory_sizes or {})
         self.pipeline_calls = []
+        self.captured_keys = []
 
     def scan(self, cursor=0, match="*", count=1000):
         return 0, list(self.keys)
@@ -1751,6 +1811,15 @@ def _recorded_batch_sizes(client, command):
         sum(operation[0] == command for operation in operations)
         for _transaction, operations in client.pipeline_calls
         if any(operation[0] == command for operation in operations)
+    ]
+
+
+def _recorded_eval_key_counts(client):
+    return [
+        len(key)
+        for _transaction, operations in client.pipeline_calls
+        for command, key, _args in operations
+        if command == "eval"
     ]
 
 
@@ -1803,23 +1872,63 @@ def test_direct_full_dump_restore_batch_is_hard_capped_at_200_keys():
     )
 
     assert result == {"migrated": 405, "failed": 0, "skipped": 0}
-    assert _recorded_batch_sizes(source, "dump") == [200, 200, 5]
-    assert _recorded_batch_sizes(source, "pttl") == [200, 200, 5]
-    assert _recorded_batch_sizes(source, "type") == [200, 200, 5]
-    assert _recorded_batch_sizes(source, "memory") == [200, 200, 5]
+    assert _recorded_eval_key_counts(source) == [200, 200, 5]
     assert _recorded_batch_sizes(target, "restore") == [200, 200, 5]
 
 
+def test_full_dump_restore_max_size_preflight_stays_batched():
+    keys = [f"key-{index}".encode() for index in range(405)]
+    oversized = keys[0]
+    source = _BatchRecordingRedis(
+        keys,
+        memory_sizes={oversized: 101},
+    )
+    target = _BatchRecordingRedis(existing_keys=keys)
+    handler = FullMigrationHandler(source, target)
+    handler._active_full_params = {"key_types": ["string"]}
+    handler._key_filter = KeySyncFilter(max_key_size=100)
+
+    result = handler._dump_restore_batch(
+        keys,
+        preserve_ttl=True,
+        overwrite_existing=True,
+    )
+
+    assert result == {"migrated": 405, "failed": 0, "skipped": 0}
+    assert len(source.pipeline_calls) == 3
+    assert _recorded_eval_key_counts(source) == [200, 200, 5]
+    assert len(source.captured_keys) == 404
+    assert oversized not in source.captured_keys
+    assert _recorded_batch_sizes(target, "restore") == [199, 200, 5]
+    assert _recorded_batch_sizes(target, "delete") == [1]
+
+
 def test_full_dump_restore_flushes_target_pipeline_at_payload_budget(monkeypatch):
+    events = []
     source = MagicMock()
-    source.pipeline.side_effect = [
-        _pipeline([6, 6]),
-        _pipeline([b"123456", -1]),
-        _pipeline([b"abcdef", -1]),
-    ]
+    first_capture = _pipeline()
+    first_capture.execute.side_effect = lambda **_kwargs: (
+        events.append("eval-1")
+        or [[
+            [2, b"123456", -1, -1, b"", 6],
+            [3],
+        ]]
+    )
+    second_capture = _pipeline()
+    second_capture.execute.side_effect = lambda **_kwargs: (
+        events.append("eval-2")
+        or [[[2, b"abcdef", -1, -1, b"", 6]]]
+    )
+    source.pipeline.side_effect = [first_capture, second_capture]
     target = MagicMock()
     first_write = _pipeline([b"OK"])
     second_write = _pipeline([b"OK"])
+    first_write.execute.side_effect = lambda **_kwargs: (
+        events.append("write-1") or [b"OK"]
+    )
+    second_write.execute.side_effect = lambda **_kwargs: (
+        events.append("write-2") or [b"OK"]
+    )
     target.pipeline.side_effect = [first_write, second_write]
     monkeypatch.setattr(full_migration_module, "MAX_DUMP_BATCH_BYTES", 10)
 
@@ -1836,6 +1945,183 @@ def test_full_dump_restore_flushes_target_pipeline_at_payload_budget(monkeypatch
     second_write.restore.assert_called_once_with(
         b"second", 0, b"abcdef", replace=True
     )
+    assert events == ["eval-1", "write-1", "eval-2", "write-2"]
+
+
+def test_full_dump_restore_allows_one_payload_larger_than_batch_budget(monkeypatch):
+    source = MagicMock()
+    source.pipeline.return_value = _atomic_capture_pipeline(
+        dump_data=b"payload-larger-than-budget",
+        memory_size=1,
+    )
+    target = MagicMock()
+    write_pipe = _pipeline([b"OK"])
+    target.pipeline.return_value = write_pipe
+    monkeypatch.setattr(full_migration_module, "MAX_DUMP_BATCH_BYTES", 10)
+
+    result = FullMigrationHandler(source, target)._dump_restore_batch(
+        [b"large"],
+        preserve_ttl=True,
+        overwrite_existing=True,
+    )
+
+    assert result == {"migrated": 1, "failed": 0, "skipped": 0}
+    assert source.pipeline.call_count == 1
+
+
+@pytest.mark.parametrize("max_key_size", [0, 100])
+def test_full_dump_restore_fails_closed_when_memory_usage_is_denied(
+    max_key_size,
+):
+    source = MagicMock()
+    source.pipeline.return_value = _atomic_capture_pipeline(
+        memory_size=-1,
+        status=4,
+    )
+    target = MagicMock()
+    handler = FullMigrationHandler(source, target)
+    handler._key_filter = KeySyncFilter(max_key_size=max_key_size)
+
+    result = handler._dump_restore_batch(
+        [b"key"],
+        preserve_ttl=True,
+        overwrite_existing=True,
+    )
+
+    assert result == {"migrated": 0, "failed": 1, "skipped": 0}
+    assert source.pipeline.call_count == 1
+    target.pipeline.assert_not_called()
+
+
+def test_full_dump_restore_releases_previous_batch_before_next_capture(monkeypatch):
+    collection_checks = []
+
+    def capture_batches(*_args, **_kwargs):
+        captured = full_migration_module.CapturedDumpState(
+            dump_data=b"first-dump",
+            pttl_ms=-1,
+            expires_at_ms=None,
+            remaining_ttl_ms=-1,
+        )
+        captured_ref = weakref.ref(captured)
+        yield [(b"first", captured)]
+        del captured
+        gc.collect()
+        collection_checks.append(captured_ref() is None)
+        yield [
+            (
+                b"second",
+                full_migration_module.CapturedDumpState(
+                    dump_data=b"second-dump",
+                    pttl_ms=-1,
+                    expires_at_ms=None,
+                    remaining_ttl_ms=-1,
+                ),
+            )
+        ]
+
+    handler = FullMigrationHandler(MagicMock(), MagicMock())
+    monkeypatch.setattr(handler, "_capture_dump_group", capture_batches)
+    monkeypatch.setattr(
+        handler,
+        "_write_dump_operations",
+        lambda operations, **_kwargs: {
+            "migrated": len(operations),
+            "failed": 0,
+            "skipped": 0,
+        },
+    )
+
+    result = handler._dump_restore_batch(
+        [b"first", b"second"],
+        preserve_ttl=True,
+        overwrite_existing=True,
+    )
+
+    assert result == {"migrated": 2, "failed": 0, "skipped": 0}
+    assert collection_checks == [True]
+
+
+def test_atomic_capture_stops_before_deferred_eval_after_empty_write_batch():
+    stop_event = threading.Event()
+    first_capture = _pipeline()
+    first_capture.execute.side_effect = lambda **_kwargs: (
+        stop_event.set() or [[[0], [3]]]
+    )
+    source = MagicMock()
+    source.pipeline.return_value = first_capture
+    target = MagicMock()
+    target.pipeline.return_value = _pipeline([0, 0])
+    handler = FullMigrationHandler(
+        source,
+        target,
+        stop_event=stop_event,
+    )
+
+    with pytest.raises(full_migration_module.MigrationError, match="取消"):
+        handler._dump_restore_batch(
+            [b"expired", b"deferred"],
+            preserve_ttl=True,
+            overwrite_existing=False,
+        )
+
+    assert source.pipeline.call_count == 1
+
+
+def test_atomic_capture_generator_releases_raw_response_before_next_eval():
+    class TrackedDump:
+        def __len__(self):
+            return 4
+
+    class CapturePipeline:
+        def __init__(self, execute):
+            self._execute = execute
+
+        def execute_command(self, *_args):
+            return self
+
+        def execute(self, **_kwargs):
+            return self._execute()
+
+    class CaptureSource:
+        def __init__(self, responses, before_second_eval):
+            self._responses = responses
+            self._before_second_eval = before_second_eval
+            self._calls = 0
+
+        def pipeline(self, **_kwargs):
+            self._calls += 1
+            if self._calls == 2:
+                self._before_second_eval()
+            return CapturePipeline(lambda: self._responses.pop(0))
+
+    payload = TrackedDump()
+    payload_ref = weakref.ref(payload)
+    collection_checks = []
+    source = CaptureSource(
+        [
+            [[[2, payload, -1, -1, b"", 4], [3]]],
+            [[[2, b"next", -1, -1, b"", 4]]],
+        ],
+        lambda: (
+            gc.collect(),
+            collection_checks.append(payload_ref() is None),
+        ),
+    )
+    captures = FullMigrationHandler(source, MagicMock())._capture_dump_group(
+        [b"first", b"second"],
+        preserve_ttl=True,
+        key_types=None,
+        min_ttl=0,
+        max_key_size=0,
+    )
+
+    first_batch = next(captures)
+    del payload, first_batch
+    second_batch = next(captures)
+
+    assert collection_checks == [True]
+    assert second_batch[0][0] == b"second"
 
 
 def test_incremental_idletime_type_and_object_pipelines_are_hard_capped():

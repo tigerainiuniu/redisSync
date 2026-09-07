@@ -13,6 +13,7 @@ import time
 import threading
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
+from itertools import chain
 from typing import Dict, List, Optional, Any, Tuple
 import redis
 from pathlib import Path
@@ -154,6 +155,12 @@ class RedisSyncService:
         self._source_snapshot: Optional[
             Dict[bytes, SourceFingerprint]
         ] = None
+        self._scan_status = {
+            'in_progress': False,
+            'last_attempt_time': None,
+            'last_success_time': None,
+            'last_error': None,
+        }
         self._target_pending_deletions: Dict[
             str, Dict[bytes, None]
         ] = {}
@@ -950,6 +957,7 @@ class RedisSyncService:
 
     def _scan_source_for_changes(self) -> Optional[SourceChangeSet]:
         """Detect exact value/TTL changes and deletions from source snapshots."""
+        self._last_source_scan_error = None
         try:
             current = self._build_source_snapshot()
             previous = self._source_snapshot or {}
@@ -1043,6 +1051,7 @@ class RedisSyncService:
                 deletions=deletions,
             )
         except Exception as e:
+            self._last_source_scan_error = str(e)
             self.logger.error("Source change scan failed: %s", e, exc_info=True)
             return None
 
@@ -1274,6 +1283,52 @@ class RedisSyncService:
                 deletion_set.add(key)
         for key, state in captured.items():
             changes.current_snapshot[key] = state.fingerprint
+
+    def _mark_change_set_pending(self, changes: SourceChangeSet) -> None:
+        """Keep every attempted key dirty until all active targets confirm it."""
+        if not changes.upserts and not changes.deletions:
+            return
+        if self._source_snapshot is None:
+            self._source_snapshot = {}
+        snapshot = self._source_snapshot
+        memory_limit = self._snapshot_memory_limit()
+        estimated_size = 0
+        if memory_limit:
+            estimated_size = (
+                self._retained_snapshot_size()
+                + self._snapshot_size(changes.current_snapshot)
+                + sys.getsizeof(changes.upserts)
+                + sys.getsizeof(changes.deletions)
+                + sys.getsizeof(changes.captured_upserts)
+                + sum(
+                    sys.getsizeof(state) + sys.getsizeof(state.dump_data)
+                    for state in changes.captured_upserts.values()
+                )
+            )
+        for key in chain(changes.upserts, changes.deletions):
+            previous = snapshot.get(key)
+            # An empty digest never matches a source SHA-256 fingerprint. Also
+            # retain new keys so a subsequent source deletion is still detected.
+            pending = (b'', None, False)
+            before_size = sys.getsizeof(snapshot) if memory_limit else 0
+            snapshot[key] = pending
+            if memory_limit:
+                estimated_size += (
+                    sys.getsizeof(snapshot) - before_size
+                    + self._snapshot_entry_size(key, pending)
+                    - (
+                        self._snapshot_entry_size(key, previous)
+                        if previous is not None else 0
+                    )
+                )
+                if estimated_size > memory_limit:
+                    if previous is None:
+                        snapshot.pop(key)
+                    else:
+                        snapshot[key] = previous
+                    raise MemoryError(
+                        "source snapshot memory_limit exceeded while marking pending keys"
+                    )
 
     def _commit_change_set(self, changes: SourceChangeSet) -> None:
         committed = self._source_snapshot
@@ -1528,11 +1583,44 @@ class RedisSyncService:
         return len(selected), skipped
 
     def _perform_unified_incremental_sync(self) -> bool:
+        """Publish a consistent health snapshot around each SCAN sync round."""
+        previous = getattr(self, '_scan_status', {})
+        self._scan_status = {
+            'in_progress': True,
+            'last_attempt_time': time.time(),
+            'last_success_time': previous.get('last_success_time'),
+            'last_error': previous.get('last_error'),
+        }
+        self._last_scan_error = None
+        succeeded = False
+        try:
+            succeeded = self._run_scan_sync_round()
+            return succeeded
+        finally:
+            self._scan_status = {
+                **self._scan_status,
+                'in_progress': False,
+                'last_success_time': (
+                    time.time() if succeeded else previous.get('last_success_time')
+                ),
+                'last_error': (
+                    None if succeeded else (
+                        self._last_scan_error
+                        or 'SCAN delivery did not complete for every target'
+                    )
+                ),
+            }
+
+    def _run_scan_sync_round(self) -> bool:
         """执行统一增量同步（扫描一次，同步到所有目标）"""
         try:
             # 1. 扫描一次源Redis
             changes = self._scan_source_for_changes()
             if changes is None:
+                self._last_scan_error = (
+                    getattr(self, '_last_source_scan_error', None)
+                    or 'source scan failed'
+                )
                 return False
             self._prepare_change_set_for_delivery(changes)
 
@@ -1557,9 +1645,11 @@ class RedisSyncService:
                 return True
 
             if not healthy_targets:
+                self._last_scan_error = 'no healthy targets available for SCAN delivery'
                 self.logger.warning("⚠️  没有健康的目标可以同步")
                 return False
 
+            self._mark_change_set_pending(changes)
             change_count = len(changes.upserts) + len(changes.deletions)
             self.logger.info(f"⇉ 并行同步 {change_count} 个键到 {len(healthy_targets)} 个目标")
 
@@ -1620,6 +1710,7 @@ class RedisSyncService:
             return all_succeeded
 
         except Exception as e:
+            self._last_scan_error = str(e)
             self.logger.error(f"❌ 统一增量同步失败: {e}", exc_info=True)
             return False
 
@@ -2646,12 +2737,27 @@ class RedisSyncService:
         replication_healthy = (
             replication is None or replication.get('healthy') is True
         )
+        scan = None
+        sync_config = getattr(self, 'config', {}).get('sync', {})
+        incremental_config = sync_config.get('incremental_sync', {})
+        if (
+            sync_config.get('mode') in {'incremental', 'hybrid'}
+            and incremental_config.get('method', 'scan') == 'scan'
+        ):
+            scan = dict(getattr(self, '_scan_status', {}))
+            scan['healthy'] = bool(
+                self.running
+                and scan.get('last_success_time') is not None
+                and scan.get('last_error') is None
+            )
         return {
             'running': self.running,
             'healthy': bool(
                 self.running and targets_healthy and replication_healthy
+                and (scan is None or scan['healthy'])
             ),
             'replication': replication,
+            'scan': scan,
             'targets': targets,
         }
     

@@ -945,7 +945,11 @@ class UnifiedIncrementalService:
 
     def _prepare_key_state(self, command: List[bytes]):
         cmd_name = command[0].decode("utf-8", errors="replace").upper()
-        if cmd_name in {"MULTI", "EXEC", "DISCARD"}:
+        # Pub/sub and script/function registries are outside the mirrored DB.
+        # GETKEYS reports an error for these legitimate keyless stream frames.
+        if cmd_name in {
+            "MULTI", "EXEC", "DISCARD", "PUBLISH", "SPUBLISH", "FUNCTION", "SCRIPT",
+        }:
             return "noop", []
         if cmd_name in {"FLUSHDB", "FLUSHALL"}:
             return "flushdb", []

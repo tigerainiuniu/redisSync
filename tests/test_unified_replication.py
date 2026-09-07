@@ -283,6 +283,55 @@ def test_psync_mode_passes_capture_max_size_to_handler(monkeypatch):
         service.stop()
 
 
+@pytest.mark.parametrize("command", [
+    [b"PUBLISH", b"channel", b"message"],
+    [b"SPUBLISH", b"channel", b"message"],
+    [b"FUNCTION", b"LOAD", b"REPLACE", b"library"],
+    [b"FUNCTION", b"FLUSH"],
+    [b"SCRIPT", b"FLUSH"],
+])
+def test_keyless_replication_commands_do_not_block_later_writes(command):
+    source = FakeSource({b"key": (b"new", -1)})
+    getkeys = source.command_getkeys
+
+    def strict_getkeys(*args):
+        if list(args) == command:
+            raise redis.ResponseError("The command has no key arguments")
+        return getkeys(*args)
+
+    source.command_getkeys = strict_getkeys
+    target, pool = target_manager()
+    service = service_for(
+        source=source, targets={"target": target},
+        config={"apply_mode": "key_state", "skip_commands": ["PING"]},
+    )
+    try:
+        assert service._on_command_received(command) is True
+        assert service._on_command_received([b"SET", b"key", b"new"]) is True
+        assert pool.connection.sent == [(b"RESTORE", b"key", b"0", b"new", b"REPLACE")]
+    finally:
+        service.stop()
+
+
+def test_key_discovery_errors_for_write_commands_still_fail_delivery():
+    source = FakeSource()
+
+    def denied(*_args):
+        raise redis.ResponseError("NOPERM COMMAND GETKEYS")
+
+    source.command_getkeys = denied
+    target, pool = target_manager()
+    service = service_for(
+        source=source, targets={"target": target},
+        config={"apply_mode": "key_state"},
+    )
+    try:
+        assert service._on_command_received([b"SET", b"key", b"new"]) is False
+        assert pool.connection.sent == []
+    finally:
+        service.stop()
+
+
 def test_stop_before_start_keeps_unified_service_stopped():
     service = UnifiedIncrementalService(
         "scan", FakeSource(), {}, {"apply_mode": "direct"}

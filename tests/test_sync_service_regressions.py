@@ -1096,13 +1096,194 @@ def test_checkpoint_commits_only_after_every_healthy_target_succeeds():
     )
 
     assert service._perform_unified_incremental_sync() is False
-    assert service._source_snapshot == previous
+    assert service._source_snapshot == {b"key": (b"", None, False)}
     assert service._source_snapshot is previous
 
     service._sync_keys_to_target = lambda name, keys, deleted, prepared: True
     assert service._perform_unified_incremental_sync() is True
     assert service._source_snapshot == current
     assert service._source_snapshot is previous
+
+
+@pytest.mark.parametrize(
+    "change", ["new_deleted", "value_reverted", "deletion_recreated"]
+)
+def test_partial_scan_delivery_reconciles_source_returning_to_checkpoint(
+    monkeypatch, change
+):
+    key = b"key"
+    original = {} if change == "new_deleted" else {key: (b"old", -1)}
+    previous = {
+        k: (hashlib.sha256(value[0]).digest(), None, False)
+        for k, value in original.items()
+    }
+    changed = {} if change == "deletion_recreated" else {key: (b"new", -1)}
+    source = FakeSource(changed)
+    service = make_service(source, previous=previous)
+    good, bad = RecordingTarget(), RecordingTarget()
+    service.orchestrators = {
+        name: SimpleNamespace(connection_manager=SimpleNamespace(
+            source_client=source, target_client=target,
+        )) for name, target in [("good", good), ("bad", bad)]
+    }
+    service.stats = {name: SyncStats() for name in service.orchestrators}
+    service.executor = ImmediateExecutor()
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            bad, "pipeline",
+            MagicMock(side_effect=redis.ConnectionError("transient outage")),
+        )
+        assert service._perform_unified_incremental_sync() is False
+
+    assert good.operations
+    good.operations.clear()
+    source.values = original
+    assert service._perform_unified_incremental_sync() is True
+    if change == "new_deleted":
+        assert good.operations == [("delete", key)]
+        assert service._source_snapshot == {}
+    else:
+        assert good.operations == [("restore", key, 0, b"old", True, False)]
+        assert service._source_snapshot[key][0] == hashlib.sha256(b"old").digest()
+
+
+def test_scan_partial_pipeline_failure_keeps_all_attempted_keys_for_reconciliation():
+    source = FakeSource({b"first": (b"new", -1), b"second": (b"new", -1)})
+    target = FailOnSecondTarget()
+    service = make_service(source, previous={})
+    service.config["service"]["performance"]["pipeline_batch_size"] = 1
+    service.orchestrators = {"target": SimpleNamespace(connection_manager=SimpleNamespace(
+        source_client=source, target_client=target,
+    ))}
+    service.stats = {"target": SyncStats()}
+    service.executor = ImmediateExecutor()
+
+    assert service._perform_unified_incremental_sync() is False
+    assert target.operations == [("restore", b"first", 0, b"new", True, False)]
+    source.values = {}
+    assert service._perform_unified_incremental_sync() is True
+    assert ("delete", b"first") in target.operations
+    assert service._source_snapshot == {}
+
+
+@pytest.mark.parametrize("previous", [None, {}])
+def test_pending_marker_memory_limit_aborts_before_target_writes(previous):
+    key = b"new-key"
+    service = make_service(FakeSource({key: (b"value", -1)}), previous=previous)
+    service.config["sync"]["mode"] = "incremental"
+    service.running = True
+    service.stats = {"target": SyncStats()}
+    service.executor = MagicMock()
+    changes = service._scan_source_for_changes()
+    service._prepare_change_set_for_delivery(changes)
+    service._scan_source_for_changes = lambda: changes
+    service._prepare_change_set_for_delivery = lambda _changes: None
+    retained_size = service._retained_snapshot_size()
+    if previous is None:
+        retained_size += sys.getsizeof({})
+    base_size = (
+        retained_size
+        + service._snapshot_size(changes.current_snapshot)
+        + sys.getsizeof(changes.upserts)
+        + sys.getsizeof(changes.deletions)
+        + sys.getsizeof(changes.captured_upserts)
+        + sum(
+            sys.getsizeof(state) + sys.getsizeof(state.dump_data)
+            for state in changes.captured_upserts.values()
+        )
+    )
+    pending_size = service._snapshot_size({key: (b"", None, False)})
+    service.config["service"]["performance"]["memory_limit"] = (
+        base_size + pending_size - sys.getsizeof({}) - 1
+    )
+
+    assert service._perform_unified_incremental_sync() is False
+    service.executor.submit.assert_not_called()
+    assert service._source_snapshot == {}
+    status = service.get_status()
+    assert status["healthy"] is False
+    assert "marking pending keys" in status["scan"]["last_error"]
+
+
+def test_scan_status_tracks_source_failure_and_successful_recovery(monkeypatch):
+    source = FakeSource({})
+    service = make_service(source, previous={})
+    service.config["sync"]["mode"] = "incremental"
+    service.config["sync"]["incremental_sync"]["method"] = "scan"
+    service.running = True
+    service.stats = {"target": SyncStats()}
+    service.executor = ImmediateExecutor()
+
+    assert service.get_status()["healthy"] is False
+    monkeypatch.setattr(sync_service_module.time, "time", lambda: 100.0)
+    assert service._perform_unified_incremental_sync() is True
+    assert service.get_status()["healthy"] is True
+    assert service.get_status()["scan"]["last_success_time"] == 100.0
+
+    monkeypatch.setattr(sync_service_module.time, "time", lambda: 200.0)
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            source, "scan",
+            MagicMock(side_effect=redis.ConnectionError("source unavailable")),
+        )
+        for _ in range(3):
+            assert service._perform_unified_incremental_sync() is False
+    status = service.get_status()
+    assert status["healthy"] is False
+    assert status["targets"]["target"]["healthy"] is True
+    assert status["scan"]["last_error"] == "source unavailable"
+    assert status["scan"]["last_attempt_time"] == 200.0
+    assert status["scan"]["last_success_time"] == 100.0
+    assert status["scan"]["in_progress"] is False
+
+    monkeypatch.setattr(sync_service_module.time, "time", lambda: 300.0)
+    assert service._perform_unified_incremental_sync() is True
+    status = service.get_status()
+    assert status["healthy"] is True
+    assert status["scan"]["last_error"] is None
+    assert status["scan"]["last_success_time"] == 300.0
+
+
+@pytest.mark.parametrize("stage", ["snapshot", "capture"])
+def test_scan_status_reports_source_read_failures_before_delivery(monkeypatch, stage):
+    service = make_service(FakeSource({b"key": (b"value", -1)}), previous={})
+    service.config["sync"]["mode"] = "hybrid"
+    service.running = True
+    service.stats = {"target": SyncStats()}
+    service.executor = MagicMock()
+    if stage == "snapshot":
+        service.config["service"]["performance"]["memory_limit"] = 1
+        expected_error = "memory_limit"
+    else:
+        monkeypatch.setattr(
+            service, "_capture_source_states",
+            MagicMock(side_effect=redis.ConnectionError("capture unavailable")),
+        )
+        expected_error = "capture unavailable"
+
+    assert service._perform_unified_incremental_sync() is False
+    service.executor.submit.assert_not_called()
+    assert service._source_snapshot == {}
+    status = service.get_status()
+    assert status["healthy"] is False
+    assert expected_error in status["scan"]["last_error"]
+    assert status["scan"]["last_success_time"] is None
+    assert status["scan"]["in_progress"] is False
+
+
+@pytest.mark.parametrize("mode,method", [
+    ("full", "scan"), ("incremental", "psync"), ("hybrid", "sync"),
+])
+def test_scan_status_does_not_affect_other_sync_modes(mode, method):
+    service = make_service(FakeSource({}))
+    service.config["sync"]["mode"] = mode
+    service.config["sync"]["incremental_sync"]["method"] = method
+    service.running = True
+    service.stats = {"target": SyncStats()}
+
+    status = service.get_status()
+    assert status["healthy"] is True
+    assert status["scan"] is None
 
 
 def test_delivery_reuses_one_captured_payload_and_commits_its_fingerprint():
@@ -1316,6 +1497,8 @@ def test_capture_payload_memory_limit_fails_before_any_target_write():
     source = FakeSource({key: (b"x" * 4096, -1)})
     target = RecordingTarget()
     service = make_service(source, previous=previous)
+    service.config["sync"]["mode"] = "incremental"
+    service.running = True
     service.orchestrators = {
         "target": SimpleNamespace(
             connection_manager=SimpleNamespace(
@@ -1343,6 +1526,9 @@ def test_capture_payload_memory_limit_fails_before_any_target_write():
     assert service._perform_unified_incremental_sync() is False
     assert target.operations == []
     assert service._source_snapshot is previous
+    status = service.get_status()
+    assert status["healthy"] is False
+    assert "capturing" in status["scan"]["last_error"]
 
 
 def test_target_only_reconciliation_deletion_is_not_fanned_out():

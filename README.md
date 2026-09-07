@@ -234,6 +234,10 @@ TTL 默认保留。源端允许 `TIME` 时使用源 Redis 的绝对时间计算�
 
 常驻服务要求 `apply_mode: key_state`。每次变更都按源端当前键状态执行 `RESTORE` 或 `DEL`，便于安全重试并保持过滤语义；`direct` 会在配置检查时被拒绝。
 
+PSYNC 只同步数据库中的键。复制流中的 `PUBLISH`、`SPUBLISH`、`FUNCTION` 和 `SCRIPT` 会跳过，后续写入照常处理；订阅消息、函数库和脚本缓存不在同步范围内。
+
+SCAN 向目标写入前，会将本轮涉及的键标记为待确认。所有参与本轮同步的目标成功后才提交指纹；部分写入失败时保留标记。即使源键在重试前被删除或改回旧值，后续轮询仍会补做删除或覆盖。
+
 `command_dedup_window` 必须为 `0`。复制流可以连续出现内容相同的合法写命令，按命令内容做时间窗口去重会丢失变更。
 
 PSYNC 实时写入中，`target_command_timeout` 是单个目标写入的硬截止时间，默认 5 秒。超时后服务会断开该目标的底层连接，其他健康目标继续同步。空闲实时写连接在 `target_connection_idle_timeout` 到期后回收。
@@ -348,13 +352,22 @@ curl -u 'redis-sync:replace-with-a-secret' http://127.0.0.1:8080/api/status
 
 Basic Auth 的用户名没有固定值，密码必须是 `security.api_key`。`/api/config` 会递归隐藏密码、token、API key、URL 和 DSN 等敏感字段。
 
-`/api/status` 的 `running` 表示服务进程正在工作，`healthy` 还会检查目标可用性和复制流状态。`replication` 中的主要字段包括：
+`/api/status` 的 `running` 表示服务进程正在工作，`healthy` 还会检查目标可用性，以及当前使用的复制流或 SCAN 轮询状态。`replication` 中的主要字段包括：
 
 - `baseline_established`：首次 FULLRESYNC 基线是否已建立
 - `committed_offset`、`received_offset`：已提交和已接收的复制 offset
 - `pending_offset_bytes`：尚未提交的复制流字节数
 - `callback_duration`：最近一次目标应用耗时
 - `stalled`、`last_error`：复制阻塞和最近错误
+
+SCAN 增量同步通过 `scan` 返回以下字段，其他同步方式下该字段为 `null`：
+
+- `in_progress`：是否正在执行一轮同步
+- `last_attempt_time`、`last_success_time`：最近一轮开始时间、最近成功时间，均为 Unix 秒时间戳；尚未发生时为 `null`
+- `last_error`：最近一轮的错误，成功后清空
+- `healthy`：已完成至少一轮同步，且最近一轮没有报错、服务仍在运行
+
+首次 SCAN 完成前、源端扫描失败、读取待同步数据失败或内存预算超限时，整体 `healthy` 为 `false`；后续轮询成功后恢复。没有键变更的一轮也算成功。
 
 `running: true`、`healthy: false` 会在页面上显示为“运行异常”。
 
@@ -378,7 +391,7 @@ Basic Auth 的用户名没有固定值，密码必须是 `security.api_key`。`/
 | `full_sync.scan_count` / `service.performance.scan_count` | 硬上限 100000；根据键大小、源端负载和链路 RTT 压测调整 |
 | `service.performance.max_workers` | 控制 SCAN 增量同步的目标并发，默认 8；其他同步路径使用内部最多 8 个工作线程 |
 | `incremental_sync.capture_max_size` | FULLRESYNC 对齐期间未消费复制流的内存与磁盘总上限 |
-| `service.performance.memory_limit` | 两份 SCAN 指纹快照的估算预算，不是操作系统级进程内存上限 |
+| `service.performance.memory_limit` | SCAN 快照、待确认键、变更列表及暂存 DUMP 数据的估算预算，不是操作系统级进程内存上限 |
 
 `queue_size`、内置指标采集、通知和配置加密字段仅为配置兼容保留，当前版本不会启动对应的队列、指标、通知或加密组件。
 
